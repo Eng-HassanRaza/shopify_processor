@@ -4,6 +4,8 @@ from flask_cors import CORS
 import logging
 import threading
 import asyncio
+import requests
+import time
 from config import HOST, PORT, DEBUG, DATABASE_PATH
 from database import Database
 from modules.review_scraper import ReviewScraper
@@ -14,12 +16,28 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app)
+# Allow all origins for extension access
+# Allow all origins for extension access
+CORS(app, resources={
+    r"/api/*": {
+        "origins": "*",
+        "methods": ["GET", "POST", "PUT", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"]
+    }
+})
 
 db = Database(str(DATABASE_PATH))
 review_scraper = ReviewScraper()
 url_finder = URLFinder(headless=False)  # Visible browser for manual search
 email_scraper = EmailScraper()
+
+# Add CORS headers to all responses for extension access
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    return response
 
 @app.route('/')
 def index():
@@ -159,30 +177,200 @@ def get_all_stores():
     stores = db.get_all_stores(app_name=app_name)
     return jsonify(stores)
 
-@app.route('/api/search', methods=['POST'])
-def search_google():
-    """Open Google search in browser for manual search"""
+
+
+@app.route('/api/search/results', methods=['POST'])
+def receive_search_results():
+    """Receive search results from Chrome extension"""
+    data = request.json
+    query = data.get('query')
+    urls = data.get('urls', [])
+    
+    logger.info(f"Received {len(urls)} URLs from extension for query: {query}")
+    
+    return jsonify({
+        'success': True,
+        'urls': urls,
+        'count': len(urls)
+    })
+
+
+# Store pending search requests
+pending_searches = {}
+search_results = {}
+
+
+@app.route('/api/search/request', methods=['POST'])
+def request_search():
+    """Request a search from extension - returns search_id for polling"""
     data = request.json
     store_name = data.get('store_name')
-    country = data.get('country', '')
     
     if not store_name:
         return jsonify({'error': 'store_name is required'}), 400
     
-    def open_search():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(url_finder.open_google_search(store_name, country))
-            return {'success': True, 'message': 'Browser opened with Google search. Please find and copy the store URL.'}
-        except Exception as e:
-            logger.error(f"Error opening browser: {e}")
-            return {'error': str(e)}
-        finally:
-            loop.close()
+    # Clean store name
+    import re
+    clean_name = store_name
+    clean_name = re.sub(r'\s*shopify\s*store\s*', ' ', clean_name, flags=re.IGNORECASE)
+    clean_name = re.sub(r'\s*\|\s*[A-Z]{2}\s*', ' ', clean_name)
+    clean_name = re.sub(r'\s*(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}', '', clean_name, flags=re.IGNORECASE)
+    clean_name = re.sub(r'\s+\d{1,2}/\d{1,2}/\d{4}', '', clean_name)
+    clean_name = ' '.join(clean_name.split()).strip()
     
-    result = open_search()
-    return jsonify(result)
+    import uuid
+    search_id = str(uuid.uuid4())
+    pending_searches[search_id] = {
+        'query': clean_name,
+        'created_at': time.time(),
+        'status': 'pending'
+    }
+    
+    logger.info(f"Search requested: query='{clean_name}', search_id={search_id}")
+    
+    return jsonify({
+        'success': True,
+        'search_id': search_id,
+        'query': clean_name,
+        'message': 'Search requested. Extension will process it.'
+    })
+
+
+@app.route('/api/search/poll/<search_id>', methods=['GET'])
+def poll_search_results(search_id):
+    """Poll for search results"""
+    if search_id in search_results:
+        results = search_results.pop(search_id)
+        if search_id in pending_searches:
+            del pending_searches[search_id]
+        return jsonify({
+            'success': True,
+            'urls': results.get('urls', []),
+            'status': 'complete'
+        })
+    elif search_id in pending_searches:
+        return jsonify({
+            'success': True,
+            'urls': [],
+            'status': 'pending'
+        })
+    else:
+        return jsonify({
+            'error': 'Search ID not found'
+        }), 404
+
+
+@app.route('/api/search/extension/submit', methods=['POST', 'OPTIONS'])
+def extension_submit_results():
+    """Extension submits results here"""
+    # Handle CORS preflight
+    if request.method == 'OPTIONS':
+        response = jsonify({})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        return response
+    
+    data = request.json
+    query = data.get('query')
+    urls = data.get('urls', [])
+    search_id = data.get('search_id')
+    
+    logger.info(f"Extension submitting results: query='{query}', search_id={search_id}, url_count={len(urls)}")
+    
+    # Find matching pending search by query if search_id not provided
+    if not search_id:
+        for sid, search in list(pending_searches.items()):
+            if search['query'].lower() == query.lower():
+                search_id = sid
+                logger.info(f"Matched search by query, found search_id: {search_id}")
+                break
+    
+    if search_id:
+        search_results[search_id] = {
+            'urls': urls,
+            'query': query,
+            'received_at': time.time()
+        }
+        # Remove from pending
+        if search_id in pending_searches:
+            del pending_searches[search_id]
+        logger.info(f"Extension submitted {len(urls)} URLs for search_id: {search_id}, query: {query}")
+    else:
+        # Create a new search_id if not found (shouldn't happen, but handle it)
+        import uuid
+        search_id = str(uuid.uuid4())
+        search_results[search_id] = {
+            'urls': urls,
+            'query': query,
+            'received_at': time.time()
+        }
+        logger.warning(f"Extension submitted {len(urls)} URLs without matching search_id, created new: {search_id}, query: {query}")
+    
+    response = jsonify({'success': True, 'search_id': search_id})
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    return response
+
+
+@app.route('/api/search/extension/pending', methods=['GET', 'OPTIONS'])
+def get_pending_search():
+    """Extension polls this to get pending searches"""
+    # Handle CORS preflight
+    if request.method == 'OPTIONS':
+        response = jsonify({})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        return response
+    
+    # Return oldest pending search that hasn't been processed
+    active_searches = {k: v for k, v in pending_searches.items() 
+                       if v.get('status') == 'pending'}
+    
+    logger.info(f"Extension polling for pending searches. Active: {len(active_searches)}, Total pending: {len(pending_searches)}")
+    
+    if active_searches:
+        oldest_id = min(active_searches.keys(), 
+                       key=lambda k: active_searches[k]['created_at'])
+        search = active_searches[oldest_id]
+        # Mark as processing
+        pending_searches[oldest_id]['status'] = 'processing'
+        logger.info(f"Extension requested search: {search['query']} (search_id: {oldest_id})")
+        response = jsonify({
+            'query': search['query'],
+            'search_id': oldest_id
+        })
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response
+    
+    # Log when no searches found (but not too often)
+    import random
+    if random.random() < 0.1:  # Log 10% of empty polls
+        logger.debug("Extension polled but no pending searches")
+    
+    response = jsonify({'query': None, 'search_id': None})
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    return response
+
+
+@app.route('/api/search/extension/status', methods=['GET', 'OPTIONS'])
+def extension_status():
+    """Check if extension is active (if it's polling this endpoint)"""
+    # Handle CORS preflight
+    if request.method == 'OPTIONS':
+        response = jsonify({})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Methods', 'GET, OPTIONS')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        return response
+    
+    # This is just to verify extension can reach Flask
+    response = jsonify({
+        'status': 'active',
+        'message': 'Extension can reach Flask server'
+    })
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    return response
 
 
 @app.route('/api/statistics')
