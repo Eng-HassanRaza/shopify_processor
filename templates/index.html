@@ -33,11 +33,18 @@
             <div class="section">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
                     <h2 style="margin: 0;">Step 2: Find Store URLs</h2>
-                    <label class="auto-mode-toggle" id="auto-mode-toggle">
-                        <input type="checkbox" id="auto-mode-checkbox">
-                        <span class="toggle-slider"></span>
-                        <span class="toggle-label">Auto Mode</span>
-                    </label>
+                    <div style="display: flex; gap: 15px; align-items: center;">
+                        <label class="auto-mode-toggle" id="auto-mode-toggle">
+                            <input type="checkbox" id="auto-mode-checkbox">
+                            <span class="toggle-slider"></span>
+                            <span class="toggle-label">Auto Mode</span>
+                        </label>
+                        <label class="auto-mode-toggle" id="ai-auto-select-toggle">
+                            <input type="checkbox" id="ai-auto-select-checkbox">
+                            <span class="toggle-slider"></span>
+                            <span class="toggle-label">AI Auto Select</span>
+                        </label>
+                    </div>
                 </div>
                 <div id="stores-container">
                     <p>No stores pending. Start scraping reviews first.</p>

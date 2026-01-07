@@ -1,6 +1,7 @@
 let currentJobId = null;
 let pollInterval = null;
 let autoMode = false; // Auto-mode state
+let aiAutoSelectMode = false; // AI auto-selection mode state
 
 document.addEventListener('DOMContentLoaded', () => {
     initializeEventListeners();
@@ -24,6 +25,24 @@ function initializeAutoMode() {
                 showStatus('Auto mode enabled. Will automatically find URLs after email scraping.', 'success');
             } else {
                 showStatus('Auto mode disabled. Manual mode active.', 'info');
+            }
+        });
+    }
+    
+    // Initialize AI auto-select mode
+    const savedAiAutoSelect = localStorage.getItem('aiAutoSelectMode') === 'true';
+    aiAutoSelectMode = savedAiAutoSelect;
+    
+    const aiAutoSelectCheckbox = document.getElementById('ai-auto-select-checkbox');
+    if (aiAutoSelectCheckbox) {
+        aiAutoSelectCheckbox.checked = aiAutoSelectMode;
+        aiAutoSelectCheckbox.addEventListener('change', (e) => {
+            aiAutoSelectMode = e.target.checked;
+            localStorage.setItem('aiAutoSelectMode', aiAutoSelectMode.toString());
+            if (aiAutoSelectMode) {
+                showStatus('AI auto-selection enabled. AI will automatically select URLs without approval.', 'success');
+            } else {
+                showStatus('AI auto-selection disabled. Manual approval required.', 'info');
             }
         });
     }
@@ -196,6 +215,7 @@ function updateProgress(job) {
 
 let currentStore = null;
 let emailCheckInterval = null;
+let isFindingUrl = false; // Guard to prevent concurrent findStoreUrl calls
 
 async function loadNextStore() {
     try {
@@ -215,6 +235,10 @@ async function loadNextStore() {
         
         currentStore = data.store;
         
+        // Escape strings for use in onclick attributes
+        const escapedStoreName = (currentStore.store_name || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
+        const escapedCountry = (currentStore.country || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
+        
         container.innerHTML = `
             <div class="store-item">
                 <h4>${currentStore.store_name}</h4>
@@ -226,7 +250,7 @@ async function loadNextStore() {
                 ${autoMode && !currentStore.base_url ? `<p class="info-message" style="color: #3498db; font-weight: 500;">🤖 Auto mode: Finding URL automatically...</p>` : ''}
                 <div class="store-actions">
                     ${!currentStore.base_url ? `
-                        <button class="btn-small" onclick="findStoreUrl(${currentStore.id}, '${currentStore.store_name}', '${currentStore.country || ''}')">Find URL</button>
+                        <button class="btn-small" onclick="findStoreUrl(${currentStore.id}, '${escapedStoreName}', '${escapedCountry}')">Find URL</button>
                         <button class="btn-small btn-skip" onclick="skipStore(${currentStore.id})">Skip</button>
                     ` : ''}
                     ${currentStore.base_url && (!currentStore.emails || currentStore.emails.length === 0) ? `
@@ -311,10 +335,12 @@ function startEmailStatusCheck() {
                     // Auto-mode: automatically trigger Find URL for next store if it has no URL
                     if (autoMode && currentStore && !currentStore.base_url) {
                         setTimeout(() => {
-                            // Double-check auto-mode is still enabled (user might have disabled it)
-                            if (autoMode && currentStore && !currentStore.base_url) {
+                            // Triple-check: auto-mode, currentStore exists, no URL, and not already finding URL
+                            if (autoMode && currentStore && !currentStore.base_url && !isFindingUrl) {
+                                // Verify store still matches (prevent race condition)
+                                const storeId = currentStore.id;
                                 showStatus('🤖 Auto mode: Automatically finding URL...', 'info');
-                                findStoreUrl(currentStore.id, currentStore.store_name, currentStore.country || '');
+                                findStoreUrl(storeId, currentStore.store_name, currentStore.country || '');
                             }
                         }, 1500); // Small delay to let UI update
                     }
@@ -334,6 +360,10 @@ async function refreshCurrentStoreDisplay() {
         const store = await response.json();
         currentStore = store;
         
+        // Escape strings for use in onclick attributes
+        const escapedStoreName = (currentStore.store_name || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
+        const escapedCountry = (currentStore.country || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
+        
         const container = document.getElementById('stores-container');
         container.innerHTML = `
             <div class="store-item">
@@ -345,7 +375,7 @@ async function refreshCurrentStoreDisplay() {
                 ${currentStore.emails && currentStore.emails.length > 0 ? `<p><strong>Emails:</strong> ${currentStore.emails.join(', ')}</p>` : ''}
                 <div class="store-actions">
                     ${!currentStore.base_url ? `
-                        <button class="btn-small" onclick="findStoreUrl(${currentStore.id}, '${currentStore.store_name}', '${currentStore.country || ''}')">Find URL</button>
+                        <button class="btn-small" onclick="findStoreUrl(${currentStore.id}, '${escapedStoreName}', '${escapedCountry}')">Find URL</button>
                         <button class="btn-small btn-skip" onclick="skipStore(${currentStore.id})">Skip</button>
                     ` : ''}
                     ${currentStore.base_url && (!currentStore.emails || currentStore.emails.length === 0) ? `
@@ -365,9 +395,30 @@ async function loadPendingStores() {
 }
 
 async function findStoreUrl(storeId, storeName, country) {
+    // Prevent concurrent calls
+    if (isFindingUrl) {
+        console.log('findStoreUrl already in progress, skipping...');
+        return;
+    }
+    
+    // Validate that storeId matches currentStore (if available)
+    if (currentStore && currentStore.id !== storeId) {
+        console.warn(`Store ID mismatch: currentStore.id=${currentStore.id}, requested storeId=${storeId}`);
+        // Still proceed, but log the warning
+    }
+    
+    isFindingUrl = true;
+    
     const modal = document.getElementById('modal');
     const modalTitle = document.getElementById('modal-title');
     const modalBody = document.getElementById('modal-body');
+    
+    // Close any existing modal first to avoid conflicts
+    if (modal.style.display === 'block') {
+        closeModal();
+        // Small delay to ensure modal is fully closed
+        await new Promise(resolve => setTimeout(resolve, 100));
+    }
     
     modalTitle.textContent = `Find URL for ${storeName}`;
     modalBody.innerHTML = '<div class="loading">Requesting search from Chrome extension...</div>';
@@ -388,7 +439,8 @@ async function findStoreUrl(storeId, storeName, country) {
             const result = await window.extensionSearch(cleanName);
             
             if (result.success && result.urls && result.urls.length > 0) {
-                displayExtractedUrls(result.urls, storeId, storeName);
+                await displayExtractedUrls(result.urls, storeId, storeName);
+                isFindingUrl = false; // Reset flag when URLs are displayed
                 return;
             }
         } catch (error) {
@@ -450,6 +502,7 @@ async function findStoreUrl(storeId, storeName, country) {
         pollForResults(searchId, storeId, storeName);
         
     } catch (error) {
+        console.error('Error in findStoreUrl:', error);
         modalBody.innerHTML = `
             <p class="error">Error: ${error.message}</p>
             <div style="margin-top: 20px;">
@@ -460,6 +513,7 @@ async function findStoreUrl(storeId, storeName, country) {
                 <button class="btn-small" onclick="confirmManualUrl(${storeId})" style="margin-top: 10px; width: 100%;">Confirm URL</button>
             </div>
         `;
+        isFindingUrl = false; // Reset flag on error
     }
 }
 
@@ -476,13 +530,15 @@ async function pollForResults(searchId, storeId, storeName) {
             const result = await response.json();
             
             if (result.status === 'complete' && result.urls && result.urls.length > 0) {
-                // Show extracted URLs
-                displayExtractedUrls(result.urls, storeId, storeName);
+                // Show extracted URLs (with AI analysis)
+                await displayExtractedUrls(result.urls, storeId, storeName);
+                isFindingUrl = false; // Reset flag when URLs are displayed
             } else if (result.status === 'pending' && attempts < maxAttempts) {
                 // Keep polling
                 setTimeout(poll, 1000);
             } else {
                 // Timeout or no results
+                isFindingUrl = false; // Reset flag on timeout
                 modalBody.innerHTML = `
                     <div class="manual-url-entry">
                         <p><strong>No URLs extracted.</strong> This might be because:</p>
@@ -504,6 +560,7 @@ async function pollForResults(searchId, storeId, storeName) {
             if (attempts < maxAttempts) {
                 setTimeout(poll, 1000);
             } else {
+                isFindingUrl = false; // Reset flag on error
                 modalBody.innerHTML = `<p class="error">Error polling for results: ${error.message}</p>`;
             }
         }
@@ -512,31 +569,142 @@ async function pollForResults(searchId, storeId, storeName) {
     poll();
 }
 
-function displayExtractedUrls(urls, storeId, storeName) {
+async function displayExtractedUrls(urls, storeId, storeName) {
     const modalBody = document.getElementById('modal-body');
     
+    // Show loading state while AI analyzes
+    modalBody.innerHTML = `
+        <div class="loading">
+            <p>🤖 AI is analyzing search results to find the best match...</p>
+        </div>
+    `;
+    
+    // Get store information for AI context
+    let country = '';
+    let reviewText = '';
+    if (currentStore) {
+        country = currentStore.country || '';
+        reviewText = currentStore.review_text || '';
+    } else {
+        // Fetch store info if not available
+        try {
+            const storeResponse = await fetch(`/api/stores/${storeId}`);
+            const storeData = await storeResponse.json();
+            country = storeData.country || '';
+            reviewText = storeData.review_text || '';
+        } catch (e) {
+            console.warn('Could not fetch store info for AI:', e);
+        }
+    }
+    
+    // Call AI endpoint to select best URL
+    let aiSelectedIndex = -1;
+    let aiConfidence = 0;
+    let aiReasoning = '';
+    
+    try {
+        const aiResponse = await fetch('/api/ai/select-url', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                store_name: storeName,
+                country: country,
+                review_text: reviewText,
+                search_results: urls
+            })
+        });
+        
+        if (aiResponse.ok) {
+            const aiResult = await aiResponse.json();
+            if (aiResult.success) {
+                aiSelectedIndex = aiResult.selected_index;
+                aiConfidence = aiResult.confidence;
+                aiReasoning = aiResult.reasoning;
+                console.log('AI selected URL:', aiResult.selected_url, 'Confidence:', aiConfidence);
+                
+                // Auto-select if AI auto-select mode is ON and confidence is high enough (>= 0.7)
+                if (aiAutoSelectMode && aiSelectedIndex >= 0 && aiSelectedIndex < urls.length && aiConfidence >= 0.7) {
+                    const selectedUrl = urls[aiSelectedIndex].url;
+                    showStatus(`🤖 AI auto-selected URL with ${Math.round(aiConfidence * 100)}% confidence. Processing...`, 'success');
+                    // Close modal and auto-select
+                    closeModal();
+                    isFindingUrl = false;
+                    // Automatically select the AI-chosen URL
+                    await selectExtractedUrl(storeId, selectedUrl);
+                    return; // Exit early, don't show the selection UI
+                }
+            }
+        } else {
+            console.warn('AI selection failed, showing all results');
+        }
+    } catch (error) {
+        console.error('Error calling AI endpoint:', error);
+        // Continue to show results even if AI fails
+    }
+    
+    // Build URLs HTML
     let urlsHtml = '<div class="extracted-urls">';
     urlsHtml += `<p><strong>Found ${urls.length} URLs. Select the correct store URL:</strong></p>`;
+    
+    if (aiSelectedIndex >= 0 && aiSelectedIndex < urls.length) {
+        const autoSelectNote = aiAutoSelectMode && aiConfidence >= 0.7 
+            ? '<br><small style="color: #666; font-style: italic;">(Auto-selection skipped due to low confidence or mode disabled)</small>'
+            : '';
+        urlsHtml += `<div style="background: #e8f5e9; border-left: 4px solid #4caf50; padding: 10px; margin-bottom: 15px; border-radius: 4px;">
+            <p style="margin: 0; font-size: 13px; color: #2e7d32;">
+                <strong>🤖 AI Recommendation:</strong> The AI selected result #${aiSelectedIndex + 1} with ${Math.round(aiConfidence * 100)}% confidence.
+                <br><small style="color: #666;">${aiReasoning}</small>
+                ${autoSelectNote}
+            </p>
+        </div>`;
+    }
+    
     urlsHtml += '<div class="url-buttons-container" style="max-height: 400px; overflow-y: auto; margin-top: 15px;">';
     
-    urls.forEach((urlData) => {
+    urls.forEach((urlData, index) => {
         try {
             const urlObj = new URL(urlData.url);
             const domain = urlObj.hostname.replace('www.', '');
             const shopifyBadge = urlData.is_shopify ? '<span class="shopify-badge" style="background: #95BF47; color: white; padding: 2px 6px; border-radius: 3px; font-size: 11px; margin-left: 8px;">Shopify</span>' : '';
             
-            const escapedUrl = urlData.url.replace(/'/g, "\\'").replace(/"/g, '&quot;');
-            const escapedTitle = (urlData.title || domain).replace(/'/g, "\\'").replace(/"/g, '&quot;');
-            const escapedSnippet = (urlData.snippet || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
+            // Properly escape URL for use in onclick attribute
+            // Need to escape: single quotes, backslashes, and newlines
+            const escapedUrl = urlData.url
+                .replace(/\\/g, '\\\\')  // Escape backslashes first
+                .replace(/'/g, "\\'")     // Escape single quotes
+                .replace(/"/g, '&quot;')  // Escape double quotes
+                .replace(/\n/g, '\\n')    // Escape newlines
+                .replace(/\r/g, '\\r');   // Escape carriage returns
+            
+            const escapedTitle = (urlData.title || domain)
+                .replace(/\\/g, '\\\\')
+                .replace(/'/g, "\\'")
+                .replace(/"/g, '&quot;')
+                .replace(/\n/g, '\\n')
+                .replace(/\r/g, '\\r');
+            
+            const escapedSnippet = (urlData.snippet || '')
+                .replace(/\\/g, '\\\\')
+                .replace(/'/g, "\\'")
+                .replace(/"/g, '&quot;')
+                .replace(/\n/g, '\\n')
+                .replace(/\r/g, '\\r');
+            
+            // Highlight AI-selected result
+            const isAISelected = index === aiSelectedIndex;
+            const borderColor = isAISelected ? '#4caf50' : '#ddd';
+            const borderWidth = isAISelected ? '3px' : '1px';
+            const backgroundColor = isAISelected ? '#f1f8e9' : 'white';
+            const aiBadge = isAISelected ? '<span style="background: #4caf50; color: white; padding: 2px 6px; border-radius: 3px; font-size: 11px; margin-left: 8px; font-weight: bold;">🤖 AI SELECTED</span>' : '';
             
             urlsHtml += `
-                <div class="url-button-item" style="margin-bottom: 10px; border: 1px solid #ddd; border-radius: 5px; padding: 12px; cursor: pointer; transition: background 0.2s; background: white;" 
+                <div class="url-button-item" style="margin-bottom: 10px; border: ${borderWidth} solid ${borderColor}; border-radius: 5px; padding: 12px; cursor: pointer; transition: all 0.2s; background: ${backgroundColor}; box-shadow: ${isAISelected ? '0 2px 8px rgba(76, 175, 80, 0.3)' : 'none'};" 
                      onclick="selectExtractedUrl(${storeId}, '${escapedUrl}')"
-                     onmouseover="this.style.background='#f5f5f5'" 
-                     onmouseout="this.style.background='white'">
-                    <div style="font-weight: bold; color: #0066cc; margin-bottom: 4px;">
-                        ${escapedTitle}
-                        ${shopifyBadge}
+                     onmouseover="this.style.background='${isAISelected ? '#e8f5e9' : '#f5f5f5'}'; this.style.transform='translateY(-1px)'" 
+                     onmouseout="this.style.background='${backgroundColor}'; this.style.transform='translateY(0)'">
+                    <div style="font-weight: bold; color: #0066cc; margin-bottom: 4px; display: flex; align-items: center; justify-content: space-between;">
+                        <span>${escapedTitle}</span>
+                        <span>${shopifyBadge}${aiBadge}</span>
                     </div>
                     <div style="font-size: 12px; color: #666; margin-bottom: 4px;">
                         ${domain}
@@ -578,12 +746,17 @@ async function selectExtractedUrl(storeId, url) {
         if (response.ok) {
             showStatus('URL saved! Email scraping started...', 'success');
             closeModal();
+            isFindingUrl = false; // Reset flag when URL is selected
+            // Refresh the current store to get updated URL
             const data = await response.json();
             if (currentStore && currentStore.id === storeId) {
-                currentStore.url = data.url;
-                currentStore.status = 'url_verified';
+                currentStore.base_url = data.url;
+                // Update the display for current store
+                await refreshCurrentStoreDisplay();
             }
-            startEmailStatusCheck(storeId);
+            // Start checking for email completion
+            startEmailStatusCheck();
+            updateStatistics();
         } else {
             const error = await response.json();
             showStatus(`Error: ${error.error || 'Failed to save URL'}`, 'error');
@@ -618,6 +791,7 @@ async function confirmManualUrl(storeId) {
         if (response.ok) {
             showStatus('URL saved! Email scraping started...', 'success');
             closeModal();
+            isFindingUrl = false; // Reset flag when URL is confirmed
             // Refresh the current store to get updated URL
             const data = await response.json();
             if (currentStore && currentStore.id === storeId) {
@@ -754,6 +928,7 @@ function showStatus(message, type) {
 
 function closeModal() {
     document.getElementById('modal').style.display = 'none';
+    isFindingUrl = false; // Reset flag when modal is closed
 }
 
 function startPolling() {

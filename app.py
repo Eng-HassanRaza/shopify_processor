@@ -11,6 +11,7 @@ from database import Database
 from modules.review_scraper import ReviewScraper
 from modules.url_finder import URLFinder
 from modules.email_scraper import EmailScraper
+from modules.ai_url_selector import AIURLSelector
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -30,6 +31,14 @@ db = Database(str(DATABASE_PATH))
 review_scraper = ReviewScraper()
 url_finder = URLFinder(headless=False)  # Visible browser for manual search
 email_scraper = EmailScraper()
+
+# Initialize AI URL Selector
+try:
+    ai_selector = AIURLSelector()
+    logger.info("AI URL Selector initialized successfully")
+except Exception as e:
+    logger.warning(f"Failed to initialize AI URL Selector: {e}. AI features will be disabled.")
+    ai_selector = None
 
 # Add CORS headers to all responses for extension access
 @app.after_request
@@ -310,6 +319,59 @@ def extension_submit_results():
     response = jsonify({'success': True, 'search_id': search_id})
     response.headers.add('Access-Control-Allow-Origin', '*')
     return response
+
+
+@app.route('/api/ai/select-url', methods=['POST', 'OPTIONS'])
+def ai_select_url():
+    """Use AI to select the best URL from search results"""
+    # Handle CORS preflight
+    if request.method == 'OPTIONS':
+        response = jsonify({})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        return response
+    
+    if not ai_selector:
+        return jsonify({
+            'error': 'AI URL Selector is not available. Check API key configuration.'
+        }), 503
+    
+    data = request.json
+    store_name = data.get('store_name')
+    country = data.get('country')
+    review_text = data.get('review_text')
+    search_results = data.get('search_results', [])
+    
+    if not store_name:
+        return jsonify({'error': 'store_name is required'}), 400
+    
+    if not search_results or len(search_results) == 0:
+        return jsonify({'error': 'search_results is required and cannot be empty'}), 400
+    
+    try:
+        logger.info(f"AI selecting URL for store: {store_name}")
+        result = ai_selector.select_best_url(
+            store_name=store_name,
+            country=country,
+            review_text=review_text,
+            search_results=search_results
+        )
+        
+        logger.info(f"AI selected URL: {result['selected_url']} (confidence: {result['confidence']:.2f})")
+        
+        return jsonify({
+            'success': True,
+            'selected_url': result['selected_url'],
+            'confidence': result['confidence'],
+            'reasoning': result['reasoning'],
+            'selected_index': result['selected_index']
+        })
+    except Exception as e:
+        logger.error(f"Error in AI URL selection: {e}", exc_info=True)
+        return jsonify({
+            'error': f'AI selection failed: {str(e)}'
+        }), 500
 
 
 @app.route('/api/search/extension/pending', methods=['GET', 'OPTIONS'])
