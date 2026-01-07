@@ -332,3 +332,56 @@ button:disabled {
     margin-top: 10px;
 }
 
+/* Auto Mode Toggle */
+.auto-mode-toggle {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    cursor: pointer;
+    user-select: none;
+}
+
+.auto-mode-toggle input[type="checkbox"] {
+    display: none;
+}
+
+.toggle-slider {
+    position: relative;
+    width: 50px;
+    height: 26px;
+    background-color: #ccc;
+    border-radius: 26px;
+    transition: background-color 0.3s;
+}
+
+.toggle-slider::before {
+    content: "";
+    position: absolute;
+    width: 20px;
+    height: 20px;
+    left: 3px;
+    top: 3px;
+    background-color: white;
+    border-radius: 50%;
+    transition: transform 0.3s;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+}
+
+.auto-mode-toggle input[type="checkbox"]:checked + .toggle-slider {
+    background-color: #3498db;
+}
+
+.auto-mode-toggle input[type="checkbox"]:checked + .toggle-slider::before {
+    transform: translateX(24px);
+}
+
+.toggle-label {
+    font-size: 14px;
+    font-weight: 500;
+    color: #2c3e50;
+}
+
+.auto-mode-toggle:hover .toggle-slider {
+    box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.2);
+}
+

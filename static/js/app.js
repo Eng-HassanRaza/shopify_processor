@@ -1,11 +1,33 @@
 let currentJobId = null;
 let pollInterval = null;
+let autoMode = false; // Auto-mode state
 
 document.addEventListener('DOMContentLoaded', () => {
     initializeEventListeners();
     startPolling();
     initializePage();
+    initializeAutoMode();
 });
+
+function initializeAutoMode() {
+    // Load auto-mode state from localStorage
+    const savedAutoMode = localStorage.getItem('autoMode') === 'true';
+    autoMode = savedAutoMode;
+    
+    const checkbox = document.getElementById('auto-mode-checkbox');
+    if (checkbox) {
+        checkbox.checked = autoMode;
+        checkbox.addEventListener('change', (e) => {
+            autoMode = e.target.checked;
+            localStorage.setItem('autoMode', autoMode.toString());
+            if (autoMode) {
+                showStatus('Auto mode enabled. Will automatically find URLs after email scraping.', 'success');
+            } else {
+                showStatus('Auto mode disabled. Manual mode active.', 'info');
+            }
+        });
+    }
+}
 
 async function initializePage() {
     // Check if there are pending stores and load the first one
@@ -201,6 +223,7 @@ async function loadNextStore() {
                 <p><strong>Status:</strong> ${currentStore.status}</p>
                 ${currentStore.base_url ? `<p><strong>URL:</strong> ${currentStore.base_url}</p>` : ''}
                 ${currentStore.emails && currentStore.emails.length > 0 ? `<p><strong>Emails:</strong> ${currentStore.emails.join(', ')}</p>` : ''}
+                ${autoMode && !currentStore.base_url ? `<p class="info-message" style="color: #3498db; font-weight: 500;">🤖 Auto mode: Finding URL automatically...</p>` : ''}
                 <div class="store-actions">
                     ${!currentStore.base_url ? `
                         <button class="btn-small" onclick="findStoreUrl(${currentStore.id}, '${currentStore.store_name}', '${currentStore.country || ''}')">Find URL</button>
@@ -281,9 +304,20 @@ function startEmailStatusCheck() {
                     ? store.emails.join(', ') 
                     : 'No emails found';
                 showStatus(`Email scraping completed. ${emailList}`, 'success');
-                setTimeout(() => {
-                    loadNextStore();
+                setTimeout(async () => {
+                    await loadNextStore();
                     updateStatistics();
+                    
+                    // Auto-mode: automatically trigger Find URL for next store if it has no URL
+                    if (autoMode && currentStore && !currentStore.base_url) {
+                        setTimeout(() => {
+                            // Double-check auto-mode is still enabled (user might have disabled it)
+                            if (autoMode && currentStore && !currentStore.base_url) {
+                                showStatus('🤖 Auto mode: Automatically finding URL...', 'info');
+                                findStoreUrl(currentStore.id, currentStore.store_name, currentStore.country || '');
+                            }
+                        }, 1500); // Small delay to let UI update
+                    }
                 }, 2000);
             }
         } catch (error) {
