@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shopify Review Processor</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Shopify Review Processor</h1>
+            <p>Unified workflow for scraping reviews, finding store URLs, and extracting emails</p>
+        </header>
+
+        <div class="main-content">
+            <div class="section">
+                <h2>Step 1: Start Review Scraping</h2>
+                <div class="input-group">
+                    <input type="text" id="app-url" placeholder="Enter Shopify App Review URL (e.g., https://apps.shopify.com/app-name/reviews)">
+                    <button id="start-scraping">Start Scraping</button>
+                </div>
+                <div id="job-status" class="status"></div>
+                <div id="progress-section" style="display: none; margin-top: 20px;">
+                    <div class="progress-bar-container">
+                        <div class="progress-bar" id="progress-bar"></div>
+                    </div>
+                    <div id="progress-message" class="progress-message"></div>
+                    <div id="progress-details" class="progress-details"></div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2>Step 2: Find Store URLs</h2>
+                <div id="stores-container">
+                    <p>No stores pending. Start scraping reviews first.</p>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2>Statistics</h2>
+                <div id="statistics" class="stats-grid">
+                    <div class="stat-item">
+                        <span class="stat-label">Total Stores</span>
+                        <span class="stat-value" id="total-stores">0</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Pending URL</span>
+                        <span class="stat-value" id="pending-url">0</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">URL Verified</span>
+                        <span class="stat-value" id="url-verified">0</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Emails Found</span>
+                        <span class="stat-value" id="emails-found">0</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2>Export Data</h2>
+                <button id="export-json">Export JSON</button>
+                <button id="export-csv">Export CSV</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="modal" class="modal">
+        <div class="modal-content">
+            <span class="close">&times;</span>
+            <h3 id="modal-title">Store URL Verification</h3>
+            <div id="modal-body"></div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
+

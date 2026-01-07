@@ -1,0 +1,32 @@
+"""Configuration settings for Shopify Review Processor"""
+import os
+from pathlib import Path
+
+# Base directory
+BASE_DIR = Path(__file__).parent.parent
+DATA_DIR = BASE_DIR / "shopify_processor" / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# Database
+DATABASE_PATH = DATA_DIR / "shopify_processor.db"
+
+# Server settings
+HOST = "127.0.0.1"
+PORT = 5000
+DEBUG = True
+
+# Browser automation settings
+BROWSER_HEADLESS = True  # Set to False to show browser
+BROWSER_SLOW_MO = 500  # Delay between actions (ms)
+BROWSER_TIMEOUT = 30000  # Page load timeout (ms)
+
+# Scraping settings
+REVIEW_SCRAPER_DELAY_MIN = 2.0
+REVIEW_SCRAPER_DELAY_MAX = 5.0
+EMAIL_SCRAPER_MAX_PAGES = 15
+EMAIL_SCRAPER_DELAY = 0.5
+
+# User agent for browser
+USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+
