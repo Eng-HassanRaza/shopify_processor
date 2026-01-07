@@ -1,11 +1,33 @@
 let currentJobId = null;
 let pollInterval = null;
+let autoMode = false; // Auto-mode state
 
 document.addEventListener('DOMContentLoaded', () => {
     initializeEventListeners();
     startPolling();
     initializePage();
+    initializeAutoMode();
 });
+
+function initializeAutoMode() {
+    // Load auto-mode state from localStorage
+    const savedAutoMode = localStorage.getItem('autoMode') === 'true';
+    autoMode = savedAutoMode;
+    
+    const checkbox = document.getElementById('auto-mode-checkbox');
+    if (checkbox) {
+        checkbox.checked = autoMode;
+        checkbox.addEventListener('change', (e) => {
+            autoMode = e.target.checked;
+            localStorage.setItem('autoMode', autoMode.toString());
+            if (autoMode) {
+                showStatus('Auto mode enabled. Will automatically find URLs after email scraping.', 'success');
+            } else {
+                showStatus('Auto mode disabled. Manual mode active.', 'info');
+            }
+        });
+    }
+}
 
 async function initializePage() {
     // Check if there are pending stores and load the first one
@@ -201,6 +223,7 @@ async function loadNextStore() {
                 <p><strong>Status:</strong> ${currentStore.status}</p>
                 ${currentStore.base_url ? `<p><strong>URL:</strong> ${currentStore.base_url}</p>` : ''}
                 ${currentStore.emails && currentStore.emails.length > 0 ? `<p><strong>Emails:</strong> ${currentStore.emails.join(', ')}</p>` : ''}
+                ${autoMode && !currentStore.base_url ? `<p class="info-message" style="color: #3498db; font-weight: 500;">🤖 Auto mode: Finding URL automatically...</p>` : ''}
                 <div class="store-actions">
                     ${!currentStore.base_url ? `
                         <button class="btn-small" onclick="findStoreUrl(${currentStore.id}, '${currentStore.store_name}', '${currentStore.country || ''}')">Find URL</button>
@@ -281,9 +304,20 @@ function startEmailStatusCheck() {
                     ? store.emails.join(', ') 
                     : 'No emails found';
                 showStatus(`Email scraping completed. ${emailList}`, 'success');
-                setTimeout(() => {
-                    loadNextStore();
+                setTimeout(async () => {
+                    await loadNextStore();
                     updateStatistics();
+                    
+                    // Auto-mode: automatically trigger Find URL for next store if it has no URL
+                    if (autoMode && currentStore && !currentStore.base_url) {
+                        setTimeout(() => {
+                            // Double-check auto-mode is still enabled (user might have disabled it)
+                            if (autoMode && currentStore && !currentStore.base_url) {
+                                showStatus('🤖 Auto mode: Automatically finding URL...', 'info');
+                                findStoreUrl(currentStore.id, currentStore.store_name, currentStore.country || '');
+                            }
+                        }, 1500); // Small delay to let UI update
+                    }
                 }, 2000);
             }
         } catch (error) {
@@ -336,43 +370,226 @@ async function findStoreUrl(storeId, storeName, country) {
     const modalBody = document.getElementById('modal-body');
     
     modalTitle.textContent = `Find URL for ${storeName}`;
-    modalBody.innerHTML = '<div class="loading">Opening Google search in browser...</div>';
+    modalBody.innerHTML = '<div class="loading">Requesting search from Chrome extension...</div>';
     modal.style.display = 'block';
     
+    // Clean store name
+    let cleanName = storeName;
+    cleanName = cleanName.replace(/\s*shopify\s*store\s*/gi, ' ');
+    cleanName = cleanName.replace(/\s*\|\s*[A-Z]{2}\s*/g, ' ');
+    cleanName = cleanName.replace(/\s*(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}/gi, '');
+    cleanName = cleanName.replace(/\s+\d{1,2}\/\d{1,2}\/\d{4}/g, '');
+    cleanName = cleanName.split(/\s+/).filter(w => w).join(' ').trim();
+    
+    // Try direct extension communication first (if extension is installed)
+    if (window.extensionSearch) {
+        try {
+            modalBody.innerHTML = '<div class="loading">Extension is searching Google...</div>';
+            const result = await window.extensionSearch(cleanName);
+            
+            if (result.success && result.urls && result.urls.length > 0) {
+                displayExtractedUrls(result.urls, storeId, storeName);
+                return;
+            }
+        } catch (error) {
+            console.log('Direct extension call failed, using polling:', error);
+        }
+    }
+    
+    // Fallback to polling method
     try {
-        const response = await fetch('/api/search', {
+        // Request search from extension via Flask
+        const response = await fetch('/api/search/request', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({store_name: storeName, country: country})
+            body: JSON.stringify({store_name: cleanName, country: country})
         });
         
         const result = await response.json();
         
         if (result.error) {
-            modalBody.innerHTML = `<p class="error">Error: ${result.error}</p>`;
+            if (result.extension_required) {
+                modalBody.innerHTML = `
+                    <div class="manual-url-entry">
+                        <p class="error"><strong>Chrome Extension Required</strong></p>
+                        <p>Please install the Chrome extension to use automatic URL extraction.</p>
+                        <p style="margin-top: 15px;">Installation instructions:</p>
+                        <ol style="font-size: 12px; margin-left: 20px;">
+                            <li>Open Chrome and go to chrome://extensions/</li>
+                            <li>Enable "Developer mode"</li>
+                            <li>Click "Load unpacked"</li>
+                            <li>Select the google_search_extension folder</li>
+                        </ol>
+                        <p style="margin-top: 15px;">You can still enter the URL manually:</p>
+                        <div class="input-group" style="margin-top: 10px;">
+                            <input type="text" id="manual-url-input" placeholder="Paste store URL here" style="width: 100%; padding: 10px;">
+                        </div>
+                        <button class="btn-small" onclick="confirmManualUrl(${storeId})" style="margin-top: 10px; width: 100%;">Confirm URL</button>
+                    </div>
+                `;
+            } else {
+                modalBody.innerHTML = `<p class="error">Error: ${result.error}</p>`;
+            }
             return;
         }
         
-        // Show form for user to enter the URL they found
+        const searchId = result.search_id;
+        
+        // Poll for results
         modalBody.innerHTML = `
-            <div class="manual-url-entry">
-                <p><strong>Browser opened!</strong> Please:</p>
-                <ol>
-                    <li>Search for the correct store URL in the browser window</li>
-                    <li>Copy the store's website URL</li>
-                    <li>Paste it below and click "Confirm URL"</li>
-                </ol>
-                <div class="input-group" style="margin-top: 20px;">
-                    <input type="text" id="manual-url-input" placeholder="Paste store URL here (e.g., https://example.com)" style="width: 100%; padding: 10px; font-size: 14px;">
-                </div>
-                <div style="margin-top: 15px; display: flex; gap: 10px;">
-                    <button class="btn-small" onclick="confirmManualUrl(${storeId})" style="flex: 1;">Confirm URL</button>
-                    <button class="btn-small" onclick="closeModal()" style="flex: 1; background: #ccc;">Cancel</button>
-                </div>
+            <div class="loading">
+                <p>Extension is searching Google...</p>
+                <p style="font-size: 12px; color: #666; margin-top: 10px;">
+                    Search ID: ${searchId}<br>
+                    Query: ${result.query}<br>
+                    <small>If nothing happens, check Chrome extension console (chrome://extensions → Extension details → Service worker)</small>
+                </p>
             </div>
         `;
+        
+        pollForResults(searchId, storeId, storeName);
+        
     } catch (error) {
-        modalBody.innerHTML = `<p class="error">Error: ${error.message}</p>`;
+        modalBody.innerHTML = `
+            <p class="error">Error: ${error.message}</p>
+            <div style="margin-top: 20px;">
+                <p>You can still enter the URL manually:</p>
+                <div class="input-group" style="margin-top: 10px;">
+                    <input type="text" id="manual-url-input" placeholder="Paste store URL here" style="width: 100%; padding: 10px;">
+                </div>
+                <button class="btn-small" onclick="confirmManualUrl(${storeId})" style="margin-top: 10px; width: 100%;">Confirm URL</button>
+            </div>
+        `;
+    }
+}
+
+async function pollForResults(searchId, storeId, storeName) {
+    const modalBody = document.getElementById('modal-body');
+    let attempts = 0;
+    const maxAttempts = 30; // 30 seconds max
+    
+    const poll = async () => {
+        attempts++;
+        
+        try {
+            const response = await fetch(`/api/search/poll/${searchId}`);
+            const result = await response.json();
+            
+            if (result.status === 'complete' && result.urls && result.urls.length > 0) {
+                // Show extracted URLs
+                displayExtractedUrls(result.urls, storeId, storeName);
+            } else if (result.status === 'pending' && attempts < maxAttempts) {
+                // Keep polling
+                setTimeout(poll, 1000);
+            } else {
+                // Timeout or no results
+                modalBody.innerHTML = `
+                    <div class="manual-url-entry">
+                        <p><strong>No URLs extracted.</strong> This might be because:</p>
+                        <ul>
+                            <li>Extension is not installed or not active</li>
+                            <li>CAPTCHA appeared on Google</li>
+                            <li>Search results didn't load in time</li>
+                        </ul>
+                        <p style="margin-top: 15px;">You can enter the URL manually:</p>
+                        <div class="input-group" style="margin-top: 10px;">
+                            <input type="text" id="manual-url-input" placeholder="Paste store URL here" style="width: 100%; padding: 10px;">
+                        </div>
+                        <button class="btn-small" onclick="confirmManualUrl(${storeId})" style="margin-top: 10px; width: 100%;">Confirm URL</button>
+                    </div>
+                `;
+            }
+        } catch (error) {
+            console.error('Polling error:', error);
+            if (attempts < maxAttempts) {
+                setTimeout(poll, 1000);
+            } else {
+                modalBody.innerHTML = `<p class="error">Error polling for results: ${error.message}</p>`;
+            }
+        }
+    };
+    
+    poll();
+}
+
+function displayExtractedUrls(urls, storeId, storeName) {
+    const modalBody = document.getElementById('modal-body');
+    
+    let urlsHtml = '<div class="extracted-urls">';
+    urlsHtml += `<p><strong>Found ${urls.length} URLs. Select the correct store URL:</strong></p>`;
+    urlsHtml += '<div class="url-buttons-container" style="max-height: 400px; overflow-y: auto; margin-top: 15px;">';
+    
+    urls.forEach((urlData) => {
+        try {
+            const urlObj = new URL(urlData.url);
+            const domain = urlObj.hostname.replace('www.', '');
+            const shopifyBadge = urlData.is_shopify ? '<span class="shopify-badge" style="background: #95BF47; color: white; padding: 2px 6px; border-radius: 3px; font-size: 11px; margin-left: 8px;">Shopify</span>' : '';
+            
+            const escapedUrl = urlData.url.replace(/'/g, "\\'").replace(/"/g, '&quot;');
+            const escapedTitle = (urlData.title || domain).replace(/'/g, "\\'").replace(/"/g, '&quot;');
+            const escapedSnippet = (urlData.snippet || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
+            
+            urlsHtml += `
+                <div class="url-button-item" style="margin-bottom: 10px; border: 1px solid #ddd; border-radius: 5px; padding: 12px; cursor: pointer; transition: background 0.2s; background: white;" 
+                     onclick="selectExtractedUrl(${storeId}, '${escapedUrl}')"
+                     onmouseover="this.style.background='#f5f5f5'" 
+                     onmouseout="this.style.background='white'">
+                    <div style="font-weight: bold; color: #0066cc; margin-bottom: 4px;">
+                        ${escapedTitle}
+                        ${shopifyBadge}
+                    </div>
+                    <div style="font-size: 12px; color: #666; margin-bottom: 4px;">
+                        ${domain}
+                    </div>
+                    ${escapedSnippet ? `<div style="font-size: 11px; color: #888; margin-top: 4px;">${escapedSnippet}</div>` : ''}
+                </div>
+            `;
+        } catch (e) {
+            console.error('Error processing URL:', e);
+        }
+    });
+    
+    urlsHtml += '</div>';
+    urlsHtml += '<div style="margin-top: 20px; padding-top: 15px; border-top: 1px solid #ddd;">';
+    urlsHtml += '<p style="font-size: 12px; color: #666; margin-bottom: 10px;">Or enter URL manually:</p>';
+    urlsHtml += '<div class="input-group">';
+    urlsHtml += '<input type="text" id="manual-url-input" placeholder="Paste store URL here" style="width: 100%; padding: 10px; font-size: 14px;">';
+    urlsHtml += '</div>';
+    urlsHtml += '<button class="btn-small" onclick="confirmManualUrl(' + storeId + ')" style="margin-top: 10px; width: 100%;">Confirm Manual URL</button>';
+    urlsHtml += '</div>';
+    urlsHtml += '</div>';
+    
+    modalBody.innerHTML = urlsHtml;
+}
+
+async function selectExtractedUrl(storeId, url) {
+    if (!url) {
+        showStatus('Invalid URL', 'error');
+        return;
+    }
+    
+    try {
+        const response = await fetch(`/api/stores/${storeId}/url`, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({url: url})
+        });
+        
+        if (response.ok) {
+            showStatus('URL saved! Email scraping started...', 'success');
+            closeModal();
+            const data = await response.json();
+            if (currentStore && currentStore.id === storeId) {
+                currentStore.url = data.url;
+                currentStore.status = 'url_verified';
+            }
+            startEmailStatusCheck(storeId);
+        } else {
+            const error = await response.json();
+            showStatus(`Error: ${error.error || 'Failed to save URL'}`, 'error');
+        }
+    } catch (error) {
+        showStatus(`Error: ${error.message}`, 'error');
     }
 }
 

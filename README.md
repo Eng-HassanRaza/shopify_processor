@@ -30,7 +30,7 @@ cd shopify_processor
 python app.py
 ```
 
-2. Open your browser to `http://127.0.0.1:5000`
+2. Open your browser to `http://127.0.0.1:5001`
 
 3. Enter a Shopify App Review URL (e.g., `https://apps.shopify.com/app-name/reviews`)
 

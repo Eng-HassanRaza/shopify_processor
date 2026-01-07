@@ -12,7 +12,7 @@ DATABASE_PATH = DATA_DIR / "shopify_processor.db"
 
 # Server settings
 HOST = "127.0.0.1"
-PORT = 5000
+PORT = 5001  # Changed from 5000 to avoid conflict with AirPlay
 DEBUG = True
 
 # Browser automation settings
