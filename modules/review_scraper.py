@@ -5,7 +5,7 @@ import time
 import random
 import logging
 from typing import List, Dict, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 logger = logging.getLogger(__name__)
 
@@ -148,13 +148,19 @@ class ReviewScraper:
                         if 'using the app' in text.lower():
                             usage_duration = text
                             break
+                
+                # Star rating - try to extract from HTML first, fallback to URL
+                rating = self.extract_rating_from_html(section)
+                if rating is None:
+                    rating = url_rating  # Fallback to URL rating
             
                 reviews.append({
                     'store_name': store_name,
                     'country': country,
                     'review_date': review_date,
                     'review_text': review_text,
-                    'usage_duration': usage_duration
+                    'usage_duration': usage_duration,
+                    'rating': rating
                 })
             except Exception as e:
                 logger.warning(f"Error parsing review section: {e}", exc_info=True)
@@ -162,12 +168,131 @@ class ReviewScraper:
         
         return reviews
     
+    def extract_rating_from_url(self, url: str) -> Optional[int]:
+        """
+        Extract star rating from review URL
+        
+        Args:
+            url: Review URL (e.g., https://apps.shopify.com/app/reviews?rating=1)
+            
+        Returns:
+            Rating as integer (1-5) or None if not found
+        """
+        try:
+            parsed = urlparse(url)
+            
+            # Check query parameter (e.g., ?rating=1)
+            query_params = parse_qs(parsed.query)
+            if 'rating' in query_params:
+                rating = int(query_params['rating'][0])
+                if 1 <= rating <= 5:
+                    return rating
+            
+            # Check path segments (e.g., /reviews/1-star or /reviews?stars=1)
+            path = parsed.path.lower()
+            if '1-star' in path or '/1' in path:
+                return 1
+            elif '2-star' in path or '/2' in path:
+                return 2
+            elif '3-star' in path or '/3' in path:
+                return 3
+            elif '4-star' in path or '/4' in path:
+                return 4
+            elif '5-star' in path or '/5' in path:
+                return 5
+            
+            # Check for stars parameter
+            if 'stars' in query_params:
+                rating = int(query_params['stars'][0])
+                if 1 <= rating <= 5:
+                    return rating
+                    
+        except Exception as e:
+            logger.debug(f"Could not extract rating from URL {url}: {e}")
+        
+        return None
+    
+    def extract_rating_from_html(self, section) -> Optional[int]:
+        """
+        Extract star rating from HTML review section
+        
+        Args:
+            section: BeautifulSoup element containing a review
+            
+        Returns:
+            Rating as integer (1-5) or None if not found
+        """
+        try:
+            # Method 1: Look for aria-label with rating (e.g., "4 out of 5 stars")
+            aria_labels = section.find_all(attrs={'aria-label': True})
+            for elem in aria_labels:
+                aria_label = elem.get('aria-label', '').lower()
+                # Match patterns like "4 out of 5 stars", "5 stars", "rated 4"
+                import re
+                match = re.search(r'(\d+)\s*(?:out of 5|stars|star)', aria_label)
+                if match:
+                    rating = int(match.group(1))
+                    if 1 <= rating <= 5:
+                        return rating
+            
+            # Method 2: Look for data attributes
+            rating_attr = section.get('data-rating') or section.get('data-star-rating')
+            if rating_attr:
+                rating = int(rating_attr)
+                if 1 <= rating <= 5:
+                    return rating
+            
+            # Method 3: Look for SVG star elements (count filled stars)
+            # Look for star icons - usually SVG elements with specific classes
+            stars = section.find_all('svg', class_=lambda x: x and 'star' in str(x).lower())
+            filled_stars = 0
+            for star in stars:
+                # Check if star is filled (has fill attribute that's not "none" or has specific class)
+                fill = star.get('fill', '')
+                classes = star.get('class', [])
+                class_str = ' '.join(classes) if isinstance(classes, list) else str(classes)
+                
+                # Count filled stars (not transparent, not empty)
+                if fill and fill.lower() not in ['none', 'transparent', '#fff', '#ffffff']:
+                    filled_stars += 1
+                elif 'filled' in class_str.lower() or 'active' in class_str.lower():
+                    filled_stars += 1
+            
+            if 1 <= filled_stars <= 5:
+                return filled_stars
+            
+            # Method 4: Look for text patterns (e.g., "★★★★☆" or "4/5")
+            text_content = section.get_text()
+            # Count star characters (★ = filled, ☆ = empty)
+            filled_count = text_content.count('★')
+            empty_count = text_content.count('☆')
+            if filled_count > 0 and filled_count <= 5:
+                return filled_count
+            
+            # Look for "X/5" pattern
+            import re
+            match = re.search(r'(\d+)\s*/\s*5', text_content)
+            if match:
+                rating = int(match.group(1))
+                if 1 <= rating <= 5:
+                    return rating
+                    
+        except Exception as e:
+            logger.debug(f"Could not extract rating from HTML: {e}")
+        
+        return None
+    
     def scrape_all_pages(self, review_url: str, max_pages: int = 0, progress_callback=None) -> List[Dict]:
         all_reviews = []
         page = 1
         empty_pages = 0
         
+        # Extract rating from URL (fallback if not found in HTML)
+        url_rating = self.extract_rating_from_url(review_url)
+        
         logger.info(f"Starting to scrape reviews from: {review_url}")
+        if url_rating:
+            logger.info(f"Rating from URL: {url_rating} stars")
         
         if progress_callback:
             progress_callback(f"Starting review scraping...", 0, 0, 0)

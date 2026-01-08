@@ -31,6 +31,10 @@ REVIEW_SCRAPER_DELAY_MAX = 5.0
 EMAIL_SCRAPER_MAX_PAGES = 15
 EMAIL_SCRAPER_DELAY = 0.5
 
+# Email processing settings
+EMAIL_USE_AI_VALIDATION = os.getenv('EMAIL_USE_AI_VALIDATION', 'false').lower() == 'true'  # Enable AI validation for ambiguous emails
+EMAIL_AI_MIN_CONFIDENCE = float(os.getenv('EMAIL_AI_MIN_CONFIDENCE', '0.7'))  # Minimum confidence for AI-validated emails
+
 # User agent for browser
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 

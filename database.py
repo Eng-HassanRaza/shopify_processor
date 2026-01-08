@@ -33,6 +33,7 @@ class Database:
                 review_date TEXT,
                 review_text TEXT,
                 usage_duration TEXT,
+                rating INTEGER,  -- Star rating (1-5)
                 base_url TEXT,
                 url_verified BOOLEAN DEFAULT 0,
                 verified_at TEXT,
@@ -45,6 +46,22 @@ class Database:
                 app_name TEXT
             )
         """)
+        
+        # Add rating column if it doesn't exist (migration for existing databases)
+        try:
+            cursor.execute("ALTER TABLE stores ADD COLUMN rating INTEGER")
+            logger.info("Added rating column to stores table")
+        except sqlite3.OperationalError:
+            # Column already exists, ignore
+            pass
+        
+        # Add raw_emails column if it doesn't exist (migration for existing databases)
+        try:
+            cursor.execute("ALTER TABLE stores ADD COLUMN raw_emails TEXT")
+            logger.info("Added raw_emails column to stores table")
+        except sqlite3.OperationalError:
+            # Column already exists, ignore
+            pass
         
         # Jobs table (for tracking scraping jobs)
         cursor.execute("""
@@ -158,15 +175,16 @@ class Database:
         for store in stores:
             cursor.execute("""
                 INSERT INTO stores (
-                    store_name, country, review_date, review_text, usage_duration,
+                    store_name, country, review_date, review_text, usage_duration, rating,
                     app_name, status
-                ) VALUES (?, ?, ?, ?, ?, ?, 'pending_url')
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending_url')
             """, (
                 store.get('store_name'),
                 store.get('country'),
                 store.get('review_date'),
                 store.get('review_text'),
                 store.get('usage_duration'),
+                store.get('rating'),  # Can be None if not found
                 app_name
             ))
         
@@ -203,6 +221,14 @@ class Database:
                     store['emails'] = []
             else:
                 store['emails'] = []
+            # Parse raw_emails JSON
+            if store.get('raw_emails'):
+                try:
+                    store['raw_emails'] = json.loads(store['raw_emails'])
+                except:
+                    store['raw_emails'] = []
+            else:
+                store['raw_emails'] = []
             stores.append(store)
         
         return stores
@@ -232,6 +258,14 @@ class Database:
                     store['emails'] = []
             else:
                 store['emails'] = []
+            # Parse raw_emails JSON
+            if store.get('raw_emails'):
+                try:
+                    store['raw_emails'] = json.loads(store['raw_emails'])
+                except:
+                    store['raw_emails'] = []
+            else:
+                store['raw_emails'] = []
             return store
         return None
     
@@ -264,19 +298,20 @@ class Database:
         conn.commit()
         conn.close()
     
-    def update_store_emails(self, store_id: int, emails: List[str]):
-        """Update store with scraped emails"""
+    def update_store_emails(self, store_id: int, emails: List[str], raw_emails: Optional[List[str]] = None):
+        """Update store with scraped emails (both cleaned and raw)"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
         emails_json = json.dumps(emails)
+        raw_emails_json = json.dumps(raw_emails) if raw_emails else None
         
         cursor.execute("""
             UPDATE stores
-            SET emails = ?, emails_found = ?, emails_scraped_at = CURRENT_TIMESTAMP,
+            SET emails = ?, raw_emails = ?, emails_found = ?, emails_scraped_at = CURRENT_TIMESTAMP,
                 status = 'emails_found', updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
-        """, (emails_json, len(emails), store_id))
+        """, (emails_json, raw_emails_json, len(emails), store_id))
         
         conn.commit()
         conn.close()
@@ -300,6 +335,14 @@ class Database:
                     store['emails'] = []
             else:
                 store['emails'] = []
+            # Parse raw_emails JSON
+            if store.get('raw_emails'):
+                try:
+                    store['raw_emails'] = json.loads(store['raw_emails'])
+                except:
+                    store['raw_emails'] = []
+            else:
+                store['raw_emails'] = []
             return store
         return None
     
@@ -327,6 +370,14 @@ class Database:
                     store['emails'] = []
             else:
                 store['emails'] = []
+            # Parse raw_emails JSON
+            if store.get('raw_emails'):
+                try:
+                    store['raw_emails'] = json.loads(store['raw_emails'])
+                except:
+                    store['raw_emails'] = []
+            else:
+                store['raw_emails'] = []
             stores.append(store)
         
         return stores

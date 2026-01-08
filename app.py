@@ -12,6 +12,8 @@ from modules.review_scraper import ReviewScraper
 from modules.url_finder import URLFinder
 from modules.email_scraper import EmailScraper
 from modules.ai_url_selector import AIURLSelector
+from modules.ai_email_extractor import AIEmailExtractor
+from typing import Optional
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -30,7 +32,17 @@ CORS(app, resources={
 db = Database(str(DATABASE_PATH))
 review_scraper = ReviewScraper()
 url_finder = URLFinder(headless=False)  # Visible browser for manual search
-email_scraper = EmailScraper()
+
+# Initialize AI Email Extractor
+try:
+    ai_email_extractor = AIEmailExtractor()
+    logger.info("AI Email Extractor initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize AI Email Extractor: {e}. Email extraction will fail without OpenAI API key.")
+    ai_email_extractor = None
+
+# Initialize Email Scraper (no longer uses EmailProcessor)
+email_scraper = EmailScraper(email_processor=None)
 
 # Initialize AI URL Selector
 try:
@@ -52,6 +64,11 @@ def after_request(response):
 def index():
     """Main page"""
     return render_template('index.html')
+
+@app.route('/data')
+def data_page():
+    """Data display page"""
+    return render_template('data.html')
 
 @app.route('/api/jobs', methods=['POST'])
 def create_job():
@@ -159,25 +176,115 @@ def update_store_url(store_id):
     cleaned_url = url_finder.clean_url(url)
     db.update_store_url(store_id, cleaned_url)
     
+    # Get store name for context in email processing
+    store = db.get_store(store_id)
+    store_name = store.get('store_name') if store else None
+    
     # Start email scraping in background
     def scrape_emails():
+        emails = []
+        raw_emails = []
+        loop = None
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
-                emails = loop.run_until_complete(email_scraper.scrape_emails(cleaned_url))
-                db.update_store_emails(store_id, emails)
-                logger.info(f"Email scraping completed for store {store_id}. Found {len(emails)} emails.")
+                # Step 1: Scrape raw emails
+                result = loop.run_until_complete(email_scraper.scrape_emails(cleaned_url, store_name))
+                
+                # Extract raw emails
+                if isinstance(result, dict):
+                    raw_emails = result.get('raw_emails', [])
+                else:
+                    raw_emails = result if isinstance(result, list) else []
+                
+                logger.info(f"Email scraping completed for store {store_id}.")
+                logger.info(f"  - Raw emails found: {len(raw_emails)}")
+                
+                # Step 2: Use AI to extract only relevant emails
+                if ai_email_extractor and raw_emails:
+                    logger.info(f"Using AI to extract relevant emails from {len(raw_emails)} raw emails...")
+                    # AI extraction is synchronous, call directly
+                    ai_result = ai_email_extractor.extract_relevant_emails(
+                        raw_emails,
+                        cleaned_url,
+                        store_name
+                    )
+                    emails = ai_result.get('emails', [])
+                    ai_stats = ai_result.get('stats', {})
+                    
+                    logger.info(f"AI extraction completed:")
+                    logger.info(f"  - Raw emails: {ai_stats.get('total_raw', 0)}")
+                    logger.info(f"  - Relevant emails: {ai_stats.get('total_relevant', 0)}")
+                else:
+                    if not ai_email_extractor:
+                        logger.warning("AI Email Extractor not available, storing all raw emails")
+                    emails = raw_emails
+                
+            except Exception as e:
+                logger.error(f"Error during email scraping: {e}", exc_info=True)
+                # Continue to update status even on error
             finally:
-                loop.close()
+                if loop:
+                    loop.close()
+            
+            # ALWAYS update store status, even if no emails found or error occurred
+            # This ensures the frontend knows scraping is complete
+            try:
+                db.update_store_emails(store_id, emails, raw_emails)
+                logger.info(f"Stored {len(emails)} relevant emails and {len(raw_emails)} raw emails for store {store_id}.")
+            except Exception as e:
+                logger.error(f"Error updating store emails in database: {e}", exc_info=True)
+                
         except Exception as e:
-            logger.error(f"Error scraping emails: {e}")
+            logger.error(f"Critical error in email scraping thread: {e}", exc_info=True)
+            # Last resort: try to mark as complete with empty emails
+            try:
+                db.update_store_emails(store_id, [], [])
+                logger.info(f"Marked store {store_id} as complete (no emails) after error")
+            except:
+                logger.error(f"Failed to update store status after critical error")
     
     thread = threading.Thread(target=scrape_emails)
     thread.daemon = True
     thread.start()
     
     return jsonify({'success': True, 'url': cleaned_url, 'message': 'URL saved. Email scraping started in background.'})
+
+@app.route('/api/stores/<int:store_id>/emails', methods=['PUT'])
+def update_store_emails_manual(store_id):
+    """Manually update cleaned emails for a store"""
+    data = request.json
+    emails = data.get('emails', [])
+    
+    if not isinstance(emails, list):
+        return jsonify({'error': 'emails must be a list'}), 400
+    
+    # Validate email format
+    import re
+    email_pattern = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$')
+    valid_emails = []
+    for email in emails:
+        email = email.strip()
+        if email and email_pattern.match(email):
+            valid_emails.append(email)
+    
+    # Get current store to preserve raw_emails
+    store = db.get_store(store_id)
+    if not store:
+        return jsonify({'error': 'Store not found'}), 404
+    
+    raw_emails = store.get('raw_emails', [])
+    
+    # Update only cleaned emails, preserve raw_emails
+    db.update_store_emails(store_id, valid_emails, raw_emails)
+    logger.info(f"Manually updated {len(valid_emails)} emails for store {store_id}")
+    
+    return jsonify({
+        'success': True,
+        'emails': valid_emails,
+        'message': f'Updated {len(valid_emails)} emails'
+    })
 
 @app.route('/api/stores')
 def get_all_stores():

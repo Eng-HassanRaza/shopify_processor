@@ -6,7 +6,7 @@ import html
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import logging
-from typing import List, Set, Optional
+from typing import List, Set, Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
 
@@ -15,9 +15,10 @@ TIMEOUT = 15
 HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
 
 class EmailScraper:
-    def __init__(self, max_pages: int = 15, delay: float = 0.5):
+    def __init__(self, max_pages: int = 15, delay: float = 0.5, email_processor: Optional[Any] = None):
         self.max_pages = max_pages
         self.delay = delay
+        self.email_processor = email_processor  # Kept for backward compatibility, not used
     
     def decode_cfemail(self, cf_str: str) -> Optional[str]:
         """Decode Cloudflare email obfuscation"""
@@ -141,8 +142,28 @@ class EmailScraper:
         
         return urls[:20]
     
-    async def scrape_emails(self, store_url: str) -> List[str]:
-        """Main function to scrape emails from a Shopify store"""
+    async def scrape_emails(
+        self, 
+        store_url: str, 
+        store_name: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Main function to scrape emails from a Shopify store
+        
+        Args:
+            store_url: Store URL to scrape
+            store_name: Optional store name for context in email processing
+            
+        Returns:
+            Dictionary with processed emails and metadata:
+            {
+                'emails': List[str],           # Final filtered emails (all_unique)
+                'primary': List[str],          # Domain + subdomain + legitimate third-party
+                'secondary': List[str],        # AI-validated ambiguous third-party
+                'categorized': Dict,           # Full categorization
+                'stats': Dict                  # Statistics
+            }
+        """
         logger.info(f"Starting email extraction for: {store_url}")
         
         if not store_url.startswith(('http://', 'https://')):
@@ -192,6 +213,7 @@ class EmailScraper:
                 
                 await asyncio.sleep(self.delay)
             
+            # Basic filtering (remove obvious spam)
             filtered_emails = set()
             for email in all_emails:
                 email_lower = email.lower()
@@ -201,7 +223,21 @@ class EmailScraper:
                 ]):
                     filtered_emails.add(email)
             
-            result = sorted(list(filtered_emails))
-            logger.info(f"Total emails found: {len(result)}")
-            return result
+            raw_emails = sorted(list(filtered_emails))
+            logger.info(f"Total raw emails found: {len(raw_emails)}")
+            
+            # Return raw emails - AI extraction will be done in app.py
+            # This keeps the scraper focused on scraping only
+            return {
+                'emails': raw_emails,  # Will be replaced by AI-extracted emails in app.py
+                'raw_emails': raw_emails,
+                'primary': raw_emails,
+                'secondary': [],
+                'categorized': {},
+                'stats': {
+                    'total_raw': len(raw_emails),
+                    'total_unique': len(raw_emails),
+                    'final_count': len(raw_emails)
+                }
+            }
 

@@ -216,6 +216,7 @@ function updateProgress(job) {
 let currentStore = null;
 let emailCheckInterval = null;
 let isFindingUrl = false; // Guard to prevent concurrent findStoreUrl calls
+let isAutoTriggering = false; // Guard to prevent multiple auto-triggers
 
 async function loadNextStore() {
     try {
@@ -243,6 +244,7 @@ async function loadNextStore() {
             <div class="store-item">
                 <h4>${currentStore.store_name}</h4>
                 <p><strong>Country:</strong> ${currentStore.country || 'N/A'}</p>
+                ${currentStore.rating ? `<p><strong>Rating:</strong> ${'★'.repeat(currentStore.rating)}${'☆'.repeat(5 - currentStore.rating)} (${currentStore.rating} stars)</p>` : ''}
                 <p><strong>Review:</strong> ${currentStore.review_text ? (currentStore.review_text.substring(0, 100) + '...') : 'N/A'}</p>
                 <p><strong>Status:</strong> ${currentStore.status}</p>
                 ${currentStore.base_url ? `<p><strong>URL:</strong> ${currentStore.base_url}</p>` : ''}
@@ -263,6 +265,40 @@ async function loadNextStore() {
         // If URL is set but emails are not found yet, start checking for completion
         if (currentStore.base_url && (!currentStore.emails || currentStore.emails.length === 0)) {
             startEmailStatusCheck();
+        }
+        // Auto-mode: automatically trigger Find URL if store has no URL and auto-mode is enabled
+        else if (autoMode && !currentStore.base_url && !isFindingUrl) {
+            // Ensure clean state
+            closeModal();
+            
+            // Set flag to prevent multiple triggers
+            isAutoTriggering = true;
+            
+            // Small delay to ensure UI is rendered before triggering
+            setTimeout(() => {
+                // Double-check conditions before triggering (ensure currentStore hasn't changed)
+                if (autoMode && currentStore && currentStore.id === data.store.id && !currentStore.base_url && !isFindingUrl) {
+                    console.log('🤖 Auto-mode: Triggering Find URL', {
+                        storeId: currentStore.id,
+                        storeName: currentStore.store_name,
+                        hasBaseUrl: !!currentStore.base_url,
+                        isFindingUrl,
+                        isAutoTriggering
+                    });
+                    showStatus('🤖 Auto mode: Automatically finding URL...', 'info');
+                    findStoreUrl(currentStore.id, currentStore.store_name, currentStore.country || '');
+                } else {
+                    // Reset flag if conditions not met
+                    isAutoTriggering = false;
+                    console.log('🤖 Auto-mode: Conditions changed, skipping Find URL', {
+                        autoMode,
+                        hasCurrentStore: !!currentStore,
+                        storeIdMatch: currentStore?.id === data.store.id,
+                        hasBaseUrl: currentStore?.base_url,
+                        isFindingUrl
+                    });
+                }
+            }, 500);
         }
     } catch (error) {
         console.error('Error loading next store:', error);
@@ -294,6 +330,8 @@ function startEmailStatusCheck() {
     
     let checkCount = 0;
     const maxChecks = 60; // Check for up to 3 minutes (60 * 3 seconds)
+    const startTime = Date.now();
+    const maxWaitTime = 5 * 60 * 1000; // 5 minutes maximum wait time
     
     emailCheckInterval = setInterval(async () => {
         if (!currentStore) {
@@ -303,6 +341,35 @@ function startEmailStatusCheck() {
         }
         
         checkCount++;
+        const elapsedTime = Date.now() - startTime;
+        
+        // Check if we've exceeded max wait time
+        if (elapsedTime > maxWaitTime) {
+            clearInterval(emailCheckInterval);
+            emailCheckInterval = null;
+            console.warn(`Email scraping timeout for store ${currentStore.id} after ${Math.round(elapsedTime / 1000)}s`);
+            
+            // If store has URL but status is still url_verified, mark as complete with no emails
+            if (currentStore.base_url && (currentStore.status === 'url_verified' || currentStore.status === 'url_found')) {
+                console.log(`Marking store ${currentStore.id} as complete (timeout, no emails found)`);
+                showStatus('Email scraping timed out. Moving to next store.', 'info');
+                
+                // Reset flags
+                isAutoTriggering = false;
+                isFindingUrl = false;
+                closeModal();
+                
+                setTimeout(async () => {
+                    await loadNextStore();
+                    updateStatistics();
+                }, 1000);
+                return;
+            }
+            
+            showStatus('Email scraping is taking longer than expected. You can manually proceed.', 'info');
+            return;
+        }
+        
         if (checkCount > maxChecks) {
             clearInterval(emailCheckInterval);
             emailCheckInterval = null;
@@ -318,33 +385,41 @@ function startEmailStatusCheck() {
             currentStore = store;
             
             // Refresh the display to show updated status
-            await refreshCurrentStoreDisplay();
+            // But skip if we're in the process of auto-triggering to avoid flickering
+            if (!isAutoTriggering && !isFindingUrl) {
+                await refreshCurrentStoreDisplay();
+            }
             
             if (store.status === 'emails_found') {
-                // Emails found, move to next store
+                // Emails found (or scraping completed with 0 emails), move to next store
                 clearInterval(emailCheckInterval);
                 emailCheckInterval = null;
+                
+                // Prevent multiple triggers
+                if (isAutoTriggering) {
+                    console.log('Auto-trigger already in progress, skipping...');
+                    return;
+                }
+                
+                // Ensure modal is closed and flags are reset before moving to next store
+                closeModal();
+                isFindingUrl = false;
+                
                 const emailList = store.emails && store.emails.length > 0 
                     ? store.emails.join(', ') 
                     : 'No emails found';
                 showStatus(`Email scraping completed. ${emailList}`, 'success');
+                
+                // Reset flags before moving to next store
+                isAutoTriggering = false;
+                isFindingUrl = false;
+                closeModal();
+                
                 setTimeout(async () => {
                     await loadNextStore();
                     updateStatistics();
-                    
-                    // Auto-mode: automatically trigger Find URL for next store if it has no URL
-                    if (autoMode && currentStore && !currentStore.base_url) {
-                        setTimeout(() => {
-                            // Triple-check: auto-mode, currentStore exists, no URL, and not already finding URL
-                            if (autoMode && currentStore && !currentStore.base_url && !isFindingUrl) {
-                                // Verify store still matches (prevent race condition)
-                                const storeId = currentStore.id;
-                                showStatus('🤖 Auto mode: Automatically finding URL...', 'info');
-                                findStoreUrl(storeId, currentStore.store_name, currentStore.country || '');
-                            }
-                        }, 1500); // Small delay to let UI update
-                    }
-                }, 2000);
+                    // Auto-trigger logic is now inside loadNextStore() after currentStore is set
+                }, 1000);
             }
         } catch (error) {
             console.error('Error checking email status:', error);
@@ -369,6 +444,7 @@ async function refreshCurrentStoreDisplay() {
             <div class="store-item">
                 <h4>${currentStore.store_name}</h4>
                 <p><strong>Country:</strong> ${currentStore.country || 'N/A'}</p>
+                ${currentStore.rating ? `<p><strong>Rating:</strong> ${'★'.repeat(currentStore.rating)}${'☆'.repeat(5 - currentStore.rating)} (${currentStore.rating} stars)</p>` : ''}
                 <p><strong>Review:</strong> ${currentStore.review_text ? (currentStore.review_text.substring(0, 100) + '...') : 'N/A'}</p>
                 <p><strong>Status:</strong> ${currentStore.status}</p>
                 ${currentStore.base_url ? `<p><strong>URL:</strong> ${currentStore.base_url}</p>` : ''}
@@ -397,7 +473,7 @@ async function loadPendingStores() {
 async function findStoreUrl(storeId, storeName, country) {
     // Prevent concurrent calls
     if (isFindingUrl) {
-        console.log('findStoreUrl already in progress, skipping...');
+        console.log('findStoreUrl already in progress, skipping...', {storeId, storeName});
         return;
     }
     
@@ -407,7 +483,12 @@ async function findStoreUrl(storeId, storeName, country) {
         // Still proceed, but log the warning
     }
     
+    // Ensure modal is closed and flags are reset before starting
+    closeModal();
     isFindingUrl = true;
+    isAutoTriggering = false; // Reset auto-trigger flag when starting findStoreUrl
+    
+    console.log('Starting findStoreUrl', {storeId, storeName, country, isFindingUrl});
     
     const modal = document.getElementById('modal');
     const modalTitle = document.getElementById('modal-title');
@@ -626,9 +707,14 @@ async function displayExtractedUrls(urls, storeId, storeName) {
                 if (aiAutoSelectMode && aiSelectedIndex >= 0 && aiSelectedIndex < urls.length && aiConfidence >= 0.7) {
                     const selectedUrl = urls[aiSelectedIndex].url;
                     showStatus(`🤖 AI auto-selected URL with ${Math.round(aiConfidence * 100)}% confidence. Processing...`, 'success');
-                    // Close modal and auto-select
+                    
+                    // Ensure modal is closed and flag is reset
                     closeModal();
                     isFindingUrl = false;
+                    
+                    // Small delay to ensure modal is fully closed before proceeding
+                    await new Promise(resolve => setTimeout(resolve, 200));
+                    
                     // Automatically select the AI-chosen URL
                     await selectExtractedUrl(storeId, selectedUrl);
                     return; // Exit early, don't show the selection UI
@@ -733,10 +819,15 @@ async function displayExtractedUrls(urls, storeId, storeName) {
 async function selectExtractedUrl(storeId, url) {
     if (!url) {
         showStatus('Invalid URL', 'error');
+        isFindingUrl = false; // Reset flag on error
         return;
     }
     
     try {
+        // Ensure modal is closed and flag is reset
+        closeModal();
+        isFindingUrl = false;
+        
         const response = await fetch(`/api/stores/${storeId}/url`, {
             method: 'PUT',
             headers: {'Content-Type': 'application/json'},
@@ -745,8 +836,7 @@ async function selectExtractedUrl(storeId, url) {
         
         if (response.ok) {
             showStatus('URL saved! Email scraping started...', 'success');
-            closeModal();
-            isFindingUrl = false; // Reset flag when URL is selected
+            
             // Refresh the current store to get updated URL
             const data = await response.json();
             if (currentStore && currentStore.id === storeId) {
@@ -754,15 +844,18 @@ async function selectExtractedUrl(storeId, url) {
                 // Update the display for current store
                 await refreshCurrentStoreDisplay();
             }
+            
             // Start checking for email completion
             startEmailStatusCheck();
             updateStatistics();
         } else {
             const error = await response.json();
             showStatus(`Error: ${error.error || 'Failed to save URL'}`, 'error');
+            isFindingUrl = false; // Reset flag on error
         }
     } catch (error) {
         showStatus(`Error: ${error.message}`, 'error');
+        isFindingUrl = false; // Reset flag on error
     }
 }
 
@@ -927,8 +1020,13 @@ function showStatus(message, type) {
 }
 
 function closeModal() {
-    document.getElementById('modal').style.display = 'none';
-    isFindingUrl = false; // Reset flag when modal is closed
+    const modal = document.getElementById('modal');
+    if (modal) {
+        modal.style.display = 'none';
+    }
+    // Reset flag when modal is closed (safety measure)
+    // Individual functions will also reset it explicitly when needed
+    isFindingUrl = false;
 }
 
 function startPolling() {
