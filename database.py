@@ -95,6 +95,16 @@ class Database:
             conn.commit()
             logger.info("Migration complete")
         
+        # Add max_reviews_limit and max_pages_limit columns if they don't exist
+        try:
+            cursor.execute("SELECT max_reviews_limit FROM jobs LIMIT 1")
+        except sqlite3.OperationalError:
+            logger.info("Adding limit columns to jobs table...")
+            cursor.execute("ALTER TABLE jobs ADD COLUMN max_reviews_limit INTEGER DEFAULT 0")
+            cursor.execute("ALTER TABLE jobs ADD COLUMN max_pages_limit INTEGER DEFAULT 0")
+            conn.commit()
+            logger.info("Limit columns added")
+        
         conn.close()
         logger.info("Database initialized")
     
@@ -108,15 +118,41 @@ class Database:
         conn.close()
         return exists
     
-    def create_job(self, app_name: str, app_url: str) -> int:
+    def get_job_by_url(self, app_url: str) -> Optional[Dict]:
+        """Get job by URL, returns job details if exists"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT * FROM jobs WHERE app_url = ? ORDER BY id DESC LIMIT 1", (app_url,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        return dict(row) if row else None
+    
+    def is_job_complete(self, job_id: int) -> bool:
+        """Check if a job is complete (status is 'completed' or 'finding_urls' or later)"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT status FROM jobs WHERE id = ?", (job_id,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            status = row[0]
+            # Job is complete if it's beyond scraping_reviews phase
+            return status in ['finding_urls', 'scraping_emails', 'completed']
+        return False
+    
+    def create_job(self, app_name: str, app_url: str, max_reviews_limit: int = 0, max_pages_limit: int = 0) -> int:
         """Create a new scraping job"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
         cursor.execute("""
-            INSERT INTO jobs (app_name, app_url, status)
-            VALUES (?, ?, 'scraping_reviews')
-        """, (app_name, app_url))
+            INSERT INTO jobs (app_name, app_url, status, max_reviews_limit, max_pages_limit)
+            VALUES (?, ?, 'scraping_reviews', ?, ?)
+        """, (app_name, app_url, max_reviews_limit, max_pages_limit))
         
         job_id = cursor.lastrowid
         conn.commit()
@@ -125,7 +161,7 @@ class Database:
     
     def update_job_status(self, job_id: int, status: str, total_stores: int = None, stores_processed: int = None, 
                          progress_message: str = None, current_page: int = None, total_pages: int = None,
-                         reviews_scraped: int = None):
+                         reviews_scraped: int = None, max_reviews_limit: int = None, max_pages_limit: int = None):
         """Update job status"""
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -156,6 +192,14 @@ class Database:
         if reviews_scraped is not None:
             updates.append("reviews_scraped = ?")
             params.append(reviews_scraped)
+        
+        if max_reviews_limit is not None:
+            updates.append("max_reviews_limit = ?")
+            params.append(max_reviews_limit)
+        
+        if max_pages_limit is not None:
+            updates.append("max_pages_limit = ?")
+            params.append(max_pages_limit)
         
         params.append(job_id)
         
@@ -403,6 +447,46 @@ class Database:
         conn.close()
         
         return [dict(row) for row in rows]
+    
+    def delete_stores(self, store_ids: List[int]) -> Dict:
+        """Delete stores by IDs and return info about deleted stores and jobs"""
+        if not store_ids:
+            return {'stores_deleted': 0, 'jobs_deleted': 0, 'app_urls': []}
+        
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        # Get store info before deletion to find associated jobs
+        placeholders = ','.join(['?'] * len(store_ids))
+        cursor.execute(f"SELECT DISTINCT app_name FROM stores WHERE id IN ({placeholders})", store_ids)
+        app_names = [row[0] for row in cursor.fetchall() if row[0]]
+        
+        # Get job URLs for these app names
+        app_urls = []
+        if app_names:
+            app_placeholders = ','.join(['?'] * len(app_names))
+            cursor.execute(f"SELECT app_url FROM jobs WHERE app_name IN ({app_placeholders})", app_names)
+            app_urls = [row[0] for row in cursor.fetchall()]
+        
+        # Delete stores
+        cursor.execute(f"DELETE FROM stores WHERE id IN ({placeholders})", store_ids)
+        stores_deleted = cursor.rowcount
+        
+        # Delete jobs associated with these app names
+        jobs_deleted = 0
+        if app_names:
+            cursor.execute(f"DELETE FROM jobs WHERE app_name IN ({app_placeholders})", app_names)
+            jobs_deleted = cursor.rowcount
+        
+        conn.commit()
+        conn.close()
+        
+        logger.info(f"Deleted {stores_deleted} stores and {jobs_deleted} jobs")
+        return {
+            'stores_deleted': stores_deleted,
+            'jobs_deleted': jobs_deleted,
+            'app_urls': app_urls
+        }
     
     def get_statistics(self, job_id: int = None) -> Dict:
         """Get processing statistics"""

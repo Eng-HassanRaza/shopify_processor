@@ -25,6 +25,20 @@
                     <input type="text" id="app-url" placeholder="Enter Shopify App Review URL (e.g., https://apps.shopify.com/app-name/reviews)">
                     <button id="start-scraping">Start Scraping</button>
                 </div>
+                <div style="margin-top: 15px; padding: 15px; background: #f8f9fa; border-radius: 4px;">
+                    <p style="margin: 0 0 10px 0; font-size: 14px; color: #666;"><strong>Optional Limits:</strong> Set limits to scrape in batches</p>
+                    <div style="display: flex; gap: 15px; flex-wrap: wrap;">
+                        <div style="flex: 1; min-width: 200px;">
+                            <label for="max-reviews" style="display: block; margin-bottom: 5px; font-size: 13px;">Max Reviews:</label>
+                            <input type="number" id="max-reviews" placeholder="Leave empty for unlimited" min="1" style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px;">
+                        </div>
+                        <div style="flex: 1; min-width: 200px;">
+                            <label for="max-pages" style="display: block; margin-bottom: 5px; font-size: 13px;">Max Pages:</label>
+                            <input type="number" id="max-pages" placeholder="Leave empty for unlimited" min="1" style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px;">
+                        </div>
+                    </div>
+                    <p style="margin: 10px 0 0 0; font-size: 12px; color: #999;">Note: If both limits are set, scraping stops when either limit is reached. Remaining reviews/pages will be scraped next time you paste the same URL.</p>
+                </div>
                 <div id="job-status" class="status"></div>
                 <div id="progress-section" style="display: none; margin-top: 20px;">
                     <div class="progress-bar-container">

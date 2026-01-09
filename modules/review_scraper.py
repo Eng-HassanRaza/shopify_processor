@@ -57,7 +57,7 @@ class ReviewScraper:
                     logger.error(f"Failed after {max_retries} attempts")
                     return None
     
-    def parse_review_data(self, soup: BeautifulSoup) -> List[Dict]:
+    def parse_review_data(self, soup: BeautifulSoup, url_rating: Optional[int] = None) -> List[Dict]:
         reviews = []
         
         # Try multiple selectors to find review sections
@@ -282,30 +282,61 @@ class ReviewScraper:
         
         return None
     
-    def scrape_all_pages(self, review_url: str, max_pages: int = 0, progress_callback=None) -> List[Dict]:
+    def scrape_all_pages(self, review_url: str, max_pages: int = 0, start_page: int = 1, 
+                         max_reviews: int = 0, progress_callback=None) -> List[Dict]:
+        """
+        Scrape all review pages from a review URL
+        
+        Args:
+            review_url: The base review URL to scrape
+            max_pages: Maximum pages to scrape (0 = no limit)
+            start_page: Page number to start from (for resuming)
+            max_reviews: Maximum number of reviews to scrape (0 = no limit)
+            progress_callback: Callback function for progress updates
+            
+        Returns:
+            List of review dictionaries
+        """
         all_reviews = []
-        page = 1
+        page = start_page
         empty_pages = 0
         
         # Extract rating from URL (fallback if not found in HTML)
         url_rating = self.extract_rating_from_url(review_url)
         
         logger.info(f"Starting to scrape reviews from: {review_url}")
+        if start_page > 1:
+            logger.info(f"Resuming from page {start_page}")
+        if max_reviews > 0:
+            logger.info(f"Max reviews limit: {max_reviews}")
+        if max_pages > 0:
+            logger.info(f"Max pages limit: {max_pages}")
         if url_rating:
             logger.info(f"Rating from URL: {url_rating} stars")
         
         if progress_callback:
-            progress_callback(f"Starting review scraping...", 0, 0, 0)
+            progress_callback(f"Starting review scraping from page {start_page}...", start_page - 1, 0, 0)
         
         while True:
-            if max_pages > 0 and page > max_pages:
+            # Check max_pages limit
+            if max_pages > 0 and page > (start_page - 1 + max_pages):
+                logger.info(f"Reached max_pages limit ({max_pages}), stopping")
+                if progress_callback:
+                    progress_callback(f"Reached max_pages limit, stopping at page {page-1}", page-1, page-1, len(all_reviews))
+                break
+            
+            # Check max_reviews limit
+            if max_reviews > 0 and len(all_reviews) >= max_reviews:
+                logger.info(f"Reached max_reviews limit ({max_reviews}), stopping")
+                if progress_callback:
+                    progress_callback(f"Reached max_reviews limit ({max_reviews}), stopping at page {page-1}", page-1, page-1, len(all_reviews))
                 break
             
             page_url = f"{review_url}&page={page}" if '?' in review_url else f"{review_url}?page={page}"
             
             logger.info(f"Scraping page {page}...")
             if progress_callback:
-                progress_callback(f"Scraping page {page}...", page, page, len(all_reviews))
+                progress_callback(f"Scraping page {page}...", page, 0, len(all_reviews))
             
             response = self.make_request(page_url)
             
@@ -320,7 +351,7 @@ class ReviewScraper:
                 continue
             
             soup = BeautifulSoup(response.text, 'html.parser')
-            page_reviews = self.parse_review_data(soup)
+            page_reviews = self.parse_review_data(soup, url_rating)
             
             if not page_reviews:
                 empty_pages += 1
@@ -331,15 +362,48 @@ class ReviewScraper:
                     break
             else:
                 empty_pages = 0
-                all_reviews.extend(page_reviews)
-                logger.info(f"Found {len(page_reviews)} reviews on page {page} (Total: {len(all_reviews)})")
-                if progress_callback:
-                    progress_callback(f"Found {len(page_reviews)} reviews on page {page}", page, page, len(all_reviews))
+                
+                # Check if adding these reviews would exceed max_reviews limit
+                if max_reviews > 0 and len(all_reviews) + len(page_reviews) > max_reviews:
+                    # Add only up to the limit
+                    remaining_slots = max_reviews - len(all_reviews)
+                    if remaining_slots > 0:
+                        all_reviews.extend(page_reviews[:remaining_slots])
+                        logger.info(f"Reached max_reviews limit. Added {remaining_slots} reviews from page {page} (Total: {len(all_reviews)})")
+                        if progress_callback:
+                            progress_callback(f"Reached max_reviews limit ({max_reviews}) at page {page}", page, page, len(all_reviews))
+                        break
+                    else:
+                        logger.info(f"Already reached max_reviews limit ({max_reviews}), stopping")
+                        if progress_callback:
+                            progress_callback(f"Already reached max_reviews limit ({max_reviews})", page-1, page-1, len(all_reviews))
+                        break
+                else:
+                    all_reviews.extend(page_reviews)
+                    logger.info(f"Found {len(page_reviews)} reviews on page {page} (Total: {len(all_reviews)})")
+                    if progress_callback:
+                        progress_callback(f"Found {len(page_reviews)} reviews on page {page}", page, page, len(all_reviews))
             
             page += 1
         
-        logger.info(f"Total reviews scraped: {len(all_reviews)}")
+        final_page = page - 1  # Last page that was successfully scraped
+        logger.info(f"Total reviews scraped: {len(all_reviews)} (from page {start_page} to {final_page})")
+        
+        # Determine stop reason for logging
+        if max_reviews > 0 and len(all_reviews) >= max_reviews:
+            logger.info(f"Stopped due to max_reviews limit ({max_reviews})")
+        elif max_pages > 0 and final_page >= (start_page - 1 + max_pages):
+            logger.info(f"Stopped due to max_pages limit ({max_pages})")
+        elif empty_pages >= 2:
+            logger.info("Stopped due to empty pages (no more reviews)")
+        
         if progress_callback:
-            progress_callback(f"Scraping complete! Found {len(all_reviews)} reviews", page-1, page-1, len(all_reviews))
+            if max_reviews > 0 and len(all_reviews) >= max_reviews:
+                progress_callback(f"Reached max reviews limit ({max_reviews}). Found {len(all_reviews)} reviews", final_page, final_page, len(all_reviews))
+            elif max_pages > 0 and final_page >= (start_page - 1 + max_pages):
+                progress_callback(f"Reached max pages limit ({max_pages}). Found {len(all_reviews)} reviews", final_page, final_page, len(all_reviews))
+            else:
+                progress_callback(f"Scraping complete! Found {len(all_reviews)} reviews", final_page, final_page, len(all_reviews))
+        
         return all_reviews
 

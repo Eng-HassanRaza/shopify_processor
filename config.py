@@ -28,8 +28,11 @@ BROWSER_TIMEOUT = 30000  # Page load timeout (ms)
 # Scraping settings
 REVIEW_SCRAPER_DELAY_MIN = 2.0
 REVIEW_SCRAPER_DELAY_MAX = 5.0
-EMAIL_SCRAPER_MAX_PAGES = 15
-EMAIL_SCRAPER_DELAY = 0.5
+EMAIL_SCRAPER_MAX_PAGES = 50  # Increased from 15 to allow more page discovery
+EMAIL_SCRAPER_DELAY = 2.0  # Increased from 0.5s to 2s to reduce rate limiting (base delay)
+EMAIL_SCRAPER_TIMEOUT = 30  # Timeout in seconds for page requests
+EMAIL_SCRAPER_MAX_RETRIES = 3  # Number of retries for failed requests
+EMAIL_SCRAPER_SITEMAP_LIMIT = 100  # Maximum URLs to extract from sitemap
 
 # Email processing settings
 EMAIL_USE_AI_VALIDATION = os.getenv('EMAIL_USE_AI_VALIDATION', 'false').lower() == 'true'  # Enable AI validation for ambiguous emails

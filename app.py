@@ -1,12 +1,12 @@
 """Main Flask application"""
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, render_template, jsonify, request, Response
 from flask_cors import CORS
 import logging
 import threading
 import asyncio
 import requests
 import time
-from config import HOST, PORT, DEBUG, DATABASE_PATH
+from config import HOST, PORT, DEBUG, DATABASE_PATH, EMAIL_SCRAPER_MAX_PAGES, EMAIL_SCRAPER_DELAY, EMAIL_SCRAPER_TIMEOUT, EMAIL_SCRAPER_MAX_RETRIES, EMAIL_SCRAPER_SITEMAP_LIMIT
 from database import Database
 from modules.review_scraper import ReviewScraper
 from modules.url_finder import URLFinder
@@ -41,8 +41,15 @@ except Exception as e:
     logger.error(f"Failed to initialize AI Email Extractor: {e}. Email extraction will fail without OpenAI API key.")
     ai_email_extractor = None
 
-# Initialize Email Scraper (no longer uses EmailProcessor)
-email_scraper = EmailScraper(email_processor=None)
+# Initialize Email Scraper with config values
+email_scraper = EmailScraper(
+    max_pages=EMAIL_SCRAPER_MAX_PAGES,
+    delay=EMAIL_SCRAPER_DELAY,
+    timeout=EMAIL_SCRAPER_TIMEOUT,
+    max_retries=EMAIL_SCRAPER_MAX_RETRIES,
+    sitemap_limit=EMAIL_SCRAPER_SITEMAP_LIMIT,
+    email_processor=None
+)
 
 # Initialize AI URL Selector
 try:
@@ -72,19 +79,161 @@ def data_page():
 
 @app.route('/api/jobs', methods=['POST'])
 def create_job():
-    """Create a new scraping job"""
+    """Create a new scraping job or resume existing incomplete job"""
     data = request.json
     app_url = data.get('app_url')
+    max_reviews = data.get('max_reviews', 0)  # 0 means no limit
+    max_pages = data.get('max_pages', 0)  # 0 means no limit
     
     if not app_url:
         return jsonify({'error': 'app_url is required'}), 400
     
-    # Check if this URL was already scraped
-    if db.job_exists(app_url):
-        return jsonify({'error': 'This app URL has already been scraped. Each review URL (1-star, 2-star, etc.) should be unique.'}), 400
+    # Validate limits
+    if max_reviews < 0:
+        return jsonify({'error': 'max_reviews must be >= 0'}), 400
+    if max_pages < 0:
+        return jsonify({'error': 'max_pages must be >= 0'}), 400
     
     app_name = review_scraper.extract_app_name(app_url)
-    job_id = db.create_job(app_name, app_url)
+    
+    # Check if job already exists
+    existing_job = db.get_job_by_url(app_url)
+    
+    if existing_job:
+        job_id = existing_job['id']
+        is_complete = db.is_job_complete(job_id)
+        
+        if is_complete:
+            return jsonify({
+                'error': 'This review URL has already been completely scraped.',
+                'job_id': job_id,
+                'message': f'Job completed. Total reviews: {existing_job.get("reviews_scraped", 0)}'
+            }), 400
+        
+        # Resume existing incomplete job
+        logger.info(f"Resuming existing job {job_id} for {app_url}")
+        current_page = existing_job.get('current_page', 0) or 0
+        start_page = max(1, current_page + 1)  # Start from next page
+        existing_reviews_count = existing_job.get('reviews_scraped', 0) or 0
+        
+        # Get limits from existing job or use new ones
+        existing_max_reviews = existing_job.get('max_reviews_limit', 0) or 0
+        existing_max_pages = existing_job.get('max_pages_limit', 0) or 0
+        
+        # If new limits are provided, update them; otherwise use existing
+        # Use new limits if provided, otherwise keep existing limits
+        final_max_reviews_limit = max_reviews if max_reviews > 0 else existing_max_reviews
+        final_max_pages_limit = max_pages if max_pages > 0 else existing_max_pages
+        
+        # If limits were updated, store the new values
+        if (max_reviews > 0 and max_reviews != existing_max_reviews) or (max_pages > 0 and max_pages != existing_max_pages):
+            db.update_job_status(job_id, existing_job.get('status', 'scraping_reviews'),
+                                max_reviews_limit=final_max_reviews_limit,
+                                max_pages_limit=final_max_pages_limit)
+        
+        # Calculate remaining limits for this batch
+        remaining_reviews = final_max_reviews_limit - existing_reviews_count if final_max_reviews_limit > 0 else 0
+        remaining_pages = final_max_pages_limit - current_page if final_max_pages_limit > 0 else 0
+        
+        def resume_scraping():
+            try:
+                # Track final page count
+                final_page_tracked = [current_page]  # Start from last known page
+                
+                def progress_callback(message, current_page_val, total_pages, reviews_count):
+                    final_page_tracked[0] = current_page_val  # Update tracked page
+                    db.update_job_status(
+                        job_id, 
+                        'scraping_reviews',
+                        progress_message=message,
+                        current_page=current_page_val,
+                        total_pages=total_pages,
+                        reviews_scraped=existing_reviews_count + reviews_count,  # Total reviews including existing
+                        max_reviews_limit=final_max_reviews_limit,
+                        max_pages_limit=final_max_pages_limit
+                    )
+                
+                # Resume from where we left off with remaining limits
+                # Scrape only remaining reviews/pages up to the limits
+                reviews = review_scraper.scrape_all_pages(
+                    app_url, 
+                    max_pages=remaining_pages if final_max_pages_limit > 0 else 0, 
+                    start_page=start_page,
+                    max_reviews=remaining_reviews if final_max_reviews_limit > 0 else 0,
+                    progress_callback=progress_callback
+                )
+                
+                # Calculate final counts
+                total_reviews = existing_reviews_count + len(reviews)
+                # Use tracked page from callback, or estimate if not available
+                final_current_page = final_page_tracked[0] if final_page_tracked[0] > current_page else (current_page + (len(reviews) // 10 + 1) if reviews else current_page)
+                
+                # Check if limits were reached or if scraping is truly complete
+                reached_reviews_limit = final_max_reviews_limit > 0 and total_reviews >= final_max_reviews_limit
+                reached_pages_limit = final_max_pages_limit > 0 and final_current_page >= final_max_pages_limit
+                no_more_reviews = len(reviews) == 0
+                
+                # Only add new reviews if we got any
+                if reviews:
+                    db.add_stores(reviews, job_id, app_name)
+                
+                # Determine if we should continue or move to next phase
+                if no_more_reviews:
+                    # No more reviews found, mark as complete
+                    db.update_job_status(
+                        job_id,
+                        'finding_urls',
+                        total_stores=total_reviews,
+                        reviews_scraped=total_reviews,
+                        current_page=final_current_page,
+                        progress_message=f"Finished scraping. Total reviews: {total_reviews}. Ready for URL finding."
+                    )
+                elif reached_reviews_limit or reached_pages_limit:
+                    # Limits reached, but more reviews might exist - keep status as scraping_reviews
+                    limit_msg = []
+                    if reached_reviews_limit:
+                        limit_msg.append(f"reached max reviews limit ({final_max_reviews_limit})")
+                    if reached_pages_limit:
+                        limit_msg.append(f"reached max pages limit ({final_max_pages_limit})")
+                    
+                    db.update_job_status(
+                        job_id,
+                        'scraping_reviews',
+                        total_stores=total_reviews,
+                        reviews_scraped=total_reviews,
+                        current_page=final_current_page,
+                        progress_message=f"Batch complete. Scraped {total_reviews} total reviews ({len(reviews)} new). {', '.join(limit_msg)}. Paste URL again to continue."
+                    )
+                else:
+                    # Unexpected case - reviews found but no limits reached, continue
+                    db.update_job_status(
+                        job_id,
+                        'finding_urls',
+                        total_stores=total_reviews,
+                        reviews_scraped=total_reviews,
+                        current_page=final_current_page,
+                        progress_message=f"Scraped {total_reviews} total reviews ({len(reviews)} new). Ready for URL finding."
+                    )
+            except Exception as e:
+                logger.error(f"Error resuming review scraping: {e}", exc_info=True)
+                db.update_job_status(job_id, 'error', progress_message=f"Error: {str(e)}")
+        
+        thread = threading.Thread(target=resume_scraping)
+        thread.daemon = True
+        thread.start()
+        
+        return jsonify({
+            'job_id': job_id, 
+            'app_name': app_name,
+            'resumed': True,
+            'message': f'Resuming from page {start_page}. Previously scraped {current_page} pages, {existing_reviews_count} reviews.',
+            'remaining_pages': remaining_pages if final_max_pages_limit > 0 else 'unlimited',
+            'remaining_reviews': remaining_reviews if final_max_reviews_limit > 0 else 'unlimited'
+        })
+    
+    # Create new job
+    job_id = db.create_job(app_name, app_url, max_reviews_limit=max_reviews, max_pages_limit=max_pages)
+    logger.info(f"Created new job {job_id} for {app_url} with limits: max_reviews={max_reviews}, max_pages={max_pages}")
     
     def scrape_reviews():
         try:
@@ -95,17 +244,75 @@ def create_job():
                     progress_message=message,
                     current_page=current_page,
                     total_pages=total_pages,
-                    reviews_scraped=reviews_count
+                    reviews_scraped=reviews_count,
+                    max_reviews_limit=max_reviews,
+                    max_pages_limit=max_pages
                 )
             
-            reviews = review_scraper.scrape_all_pages(app_url, max_pages=0, progress_callback=progress_callback)
-            db.add_stores(reviews, job_id, app_name)
-            db.update_job_status(
-                job_id, 
-                'finding_urls', 
-                total_stores=len(reviews),
-                progress_message=f"Scraped {len(reviews)} reviews. Ready for URL finding."
+            # Track final page count during scraping
+            final_page_count = [0]  # Use list to allow modification in nested function
+            
+            def tracked_progress_callback(message, current_page_val, total_pages, reviews_count):
+                final_page_count[0] = current_page_val  # Track latest page
+                progress_callback(message, current_page_val, total_pages, reviews_count)
+            
+            reviews = review_scraper.scrape_all_pages(
+                app_url, 
+                max_pages=max_pages, 
+                start_page=1,
+                max_reviews=max_reviews,
+                progress_callback=tracked_progress_callback
             )
+            
+            if reviews:
+                db.add_stores(reviews, job_id, app_name)
+            
+            # Check if limits were reached
+            total_reviews_scraped = len(reviews)
+            final_page = final_page_count[0] if final_page_count[0] > 0 else (max_pages if max_pages > 0 else (len(reviews) // 10 + 1))
+            
+            reached_reviews_limit = max_reviews > 0 and total_reviews_scraped >= max_reviews
+            reached_pages_limit = max_pages > 0 and final_page >= max_pages
+            no_more_reviews = total_reviews_scraped == 0  # Could mean no more reviews exist
+            
+            if no_more_reviews:
+                # No reviews found, might be complete
+                db.update_job_status(
+                    job_id, 
+                    'finding_urls', 
+                    total_stores=total_reviews_scraped,
+                    reviews_scraped=total_reviews_scraped,
+                    current_page=final_page,
+                    progress_message=f"Finished scraping. Found {total_reviews_scraped} reviews. Ready for URL finding."
+                )
+            elif reached_reviews_limit or reached_pages_limit:
+                # Limits reached, keep as scraping_reviews so it can be resumed
+                limit_msg = []
+                if reached_reviews_limit:
+                    limit_msg.append(f"reached max reviews limit ({max_reviews})")
+                if reached_pages_limit:
+                    limit_msg.append(f"reached max pages limit ({max_pages})")
+                
+                db.update_job_status(
+                    job_id,
+                    'scraping_reviews',
+                    total_stores=total_reviews_scraped,
+                    reviews_scraped=total_reviews_scraped,
+                    current_page=final_page,
+                    max_reviews_limit=max_reviews,
+                    max_pages_limit=max_pages,
+                    progress_message=f"Batch complete. Scraped {total_reviews_scraped} reviews. {', '.join(limit_msg)}. Paste URL again to continue."
+                )
+            else:
+                # No limits or scraping naturally completed, move to next phase
+                db.update_job_status(
+                    job_id, 
+                    'finding_urls', 
+                    total_stores=total_reviews_scraped,
+                    reviews_scraped=total_reviews_scraped,
+                    current_page=final_page,
+                    progress_message=f"Scraped {total_reviews_scraped} reviews. Ready for URL finding."
+                )
         except Exception as e:
             logger.error(f"Error scraping reviews: {e}", exc_info=True)
             db.update_job_status(job_id, 'error', progress_message=f"Error: {str(e)}")
@@ -114,7 +321,7 @@ def create_job():
     thread.daemon = True
     thread.start()
     
-    return jsonify({'job_id': job_id, 'app_name': app_name})
+    return jsonify({'job_id': job_id, 'app_name': app_name, 'resumed': False})
 
 @app.route('/api/jobs')
 def get_all_jobs():
@@ -292,6 +499,85 @@ def get_all_stores():
     app_name = request.args.get('app_name')
     stores = db.get_all_stores(app_name=app_name)
     return jsonify(stores)
+
+@app.route('/api/stores/export', methods=['POST'])
+def export_stores():
+    """Export filtered stores to CSV"""
+    import csv
+    import io
+    
+    data = request.json
+    store_ids = data.get('store_ids', [])
+    
+    if not store_ids:
+        return jsonify({'error': 'No stores to export'}), 400
+    
+    # Get stores by IDs
+    all_stores = db.get_all_stores()
+    stores_to_export = [s for s in all_stores if s['id'] in store_ids]
+    
+    # Create CSV
+    output = io.StringIO()
+    writer = csv.writer(output)
+    
+    # Write header
+    writer.writerow([
+        'ID', 'Store Name', 'Country', 'Rating', 'Review Text', 'Review Date',
+        'Usage Duration', 'Base URL', 'Raw Emails', 'Cleaned Emails',
+        'Status', 'App Name', 'Created At'
+    ])
+    
+    # Write data
+    for store in stores_to_export:
+        raw_emails = store.get('raw_emails', [])
+        cleaned_emails = store.get('emails', [])
+        writer.writerow([
+            store.get('id'),
+            store.get('store_name', ''),
+            store.get('country', ''),
+            store.get('rating', ''),
+            store.get('review_text', ''),
+            store.get('review_date', ''),
+            store.get('usage_duration', ''),
+            store.get('base_url', ''),
+            ', '.join(raw_emails) if raw_emails else '',
+            ', '.join(cleaned_emails) if cleaned_emails else '',
+            store.get('status', ''),
+            store.get('app_name', ''),
+            store.get('created_at', '')
+        ])
+    
+    output.seek(0)
+    return Response(
+        output.getvalue(),
+        mimetype='text/csv',
+        headers={'Content-Disposition': 'attachment; filename=shopify_stores_export.csv'}
+    )
+
+@app.route('/api/stores/delete', methods=['POST'])
+def delete_stores():
+    """Delete stores and associated jobs"""
+    data = request.json
+    store_ids = data.get('store_ids', [])
+    
+    if not store_ids:
+        return jsonify({'error': 'No stores to delete'}), 400
+    
+    if not isinstance(store_ids, list):
+        return jsonify({'error': 'store_ids must be a list'}), 400
+    
+    try:
+        result = db.delete_stores(store_ids)
+        return jsonify({
+            'success': True,
+            'stores_deleted': result['stores_deleted'],
+            'jobs_deleted': result['jobs_deleted'],
+            'app_urls': result['app_urls'],
+            'message': f"Deleted {result['stores_deleted']} stores and {result['jobs_deleted']} review page URLs"
+        })
+    except Exception as e:
+        logger.error(f"Error deleting stores: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
 
 
 
