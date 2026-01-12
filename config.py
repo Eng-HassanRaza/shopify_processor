@@ -13,6 +13,17 @@ DATA_DIR = BASE_DIR / "shopify_processor" / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # Database
+# PostgreSQL connection settings
+DB_HOST = os.getenv('DB_HOST', 'localhost')
+DB_PORT = os.getenv('DB_PORT', '5432')
+DB_NAME = os.getenv('DB_NAME', 'shopify_processor')
+DB_USER = os.getenv('DB_USER', 'hassanraza')
+DB_PASSWORD = os.getenv('DB_PASSWORD', '')
+
+# Database connection string (for psycopg2)
+DATABASE_URL = os.getenv('DATABASE_URL', f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
+
+# Legacy SQLite path (for migration reference)
 DATABASE_PATH = DATA_DIR / "shopify_processor.db"
 
 # Server settings

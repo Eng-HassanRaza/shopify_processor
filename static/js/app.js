@@ -2,6 +2,7 @@ let currentJobId = null;
 let pollInterval = null;
 let autoMode = false; // Auto-mode state
 let aiAutoSelectMode = false; // AI auto-selection mode state
+let urlFindingActive = false; // Track if URL finding is actively running
 
 document.addEventListener('DOMContentLoaded', () => {
     initializeEventListeners();
@@ -21,8 +22,9 @@ function initializeAutoMode() {
         checkbox.addEventListener('change', (e) => {
             autoMode = e.target.checked;
             localStorage.setItem('autoMode', autoMode.toString());
+            updateUrlFindingButtons();
             if (autoMode) {
-                showStatus('Auto mode enabled. Will automatically find URLs after email scraping.', 'success');
+                showStatus('Auto mode enabled. Click "Start URL Finding" to begin.', 'success');
             } else {
                 showStatus('Auto mode disabled. Manual mode active.', 'info');
             }
@@ -49,39 +51,60 @@ function initializeAutoMode() {
 }
 
 async function initializePage() {
-    // Check if there are pending stores and load the first one
+    // Check if email scraping is in progress
     try {
-        const response = await fetch('/api/stores/next');
-        const data = await response.json();
-        
-        if (data.store) {
-            // There are pending stores, load the first one
-            await loadNextStore();
-        } else {
-            // Check if there are any active jobs that might have stores
-            try {
-                const jobsResponse = await fetch('/api/jobs');
-                if (jobsResponse.ok) {
-                    const jobs = await jobsResponse.json();
-                    // Find the most recent job that's in 'finding_urls' or 'scraping_reviews' status
-                    const activeJob = jobs.find(job => 
-                        job.status === 'finding_urls' || job.status === 'scraping_reviews'
-                    );
-                    if (activeJob) {
-                        currentJobId = activeJob.id;
-                        // If status is finding_urls, try to load stores
-                        if (activeJob.status === 'finding_urls') {
-                            await loadNextStore();
-                        }
-                    }
-                }
-            } catch (jobsError) {
-                console.error('Error fetching jobs:', jobsError);
+        const batchStatusResponse = await fetch('/api/email-scraping/batch/status');
+        if (batchStatusResponse.ok) {
+            const batchStatus = await batchStatusResponse.json();
+            if (batchStatus.is_processing || batchStatus.pending_count > 0) {
+                // Email scraping is active, show that phase
+                startBatchEmailScrapingMonitor();
+                return;
             }
         }
     } catch (error) {
-        console.error('Error initializing page:', error);
+        console.error('Error checking batch status:', error);
     }
+    
+    // Check URL finding status (but don't auto-start)
+    try {
+        const urlStatusResponse = await fetch('/api/stores/url-finding-status');
+        if (urlStatusResponse.ok) {
+            const urlStatus = await urlStatusResponse.json();
+            
+            if (urlStatus.is_complete && urlStatus.stores_with_urls > 0) {
+                // All URLs found, start email scraping
+                await startBatchEmailScraping();
+                return;
+            } else if (urlStatus.pending_count > 0) {
+                // Show status but don't start automatically
+                await displayUrlFindingStatus(urlStatus);
+                updateUrlFindingButtons();
+                // Start monitoring to keep status updated
+                if (!urlFindingStatusInterval) {
+                    startUrlFindingStatusMonitor();
+                }
+                return;
+            } else {
+                // No pending stores, but show status anyway
+                await displayUrlFindingStatus(urlStatus);
+                updateUrlFindingButtons();
+                return;
+            }
+        }
+    } catch (error) {
+        console.error('Error checking URL status:', error);
+    }
+    
+    // Just show status, don't auto-start
+    updateUrlFindingButtons();
+    
+    // Also check button state periodically
+    setInterval(() => {
+        if (!urlFindingActive && !urlFindingStatusInterval) {
+            updateUrlFindingButtons();
+        }
+    }, 5000);
 }
 
 function initializeEventListeners() {
@@ -89,6 +112,16 @@ function initializeEventListeners() {
     document.getElementById('export-json').addEventListener('click', exportJSON);
     document.getElementById('export-csv').addEventListener('click', exportCSV);
     document.querySelector('.close').addEventListener('click', closeModal);
+    
+    const startUrlFindingBtn = document.getElementById('start-url-finding');
+    const stopUrlFindingBtn = document.getElementById('stop-url-finding');
+    
+    if (startUrlFindingBtn) {
+        startUrlFindingBtn.addEventListener('click', startUrlFinding);
+    }
+    if (stopUrlFindingBtn) {
+        stopUrlFindingBtn.addEventListener('click', stopUrlFinding);
+    }
     
     window.addEventListener('click', (e) => {
         if (e.target.classList.contains('modal')) {
@@ -189,7 +222,8 @@ function pollJobStatus() {
             updateProgress(job);
             
             if (job.status === 'finding_urls') {
-                loadNextStore(); // Load first store when reviews are done
+                // Reviews are done, update buttons but don't auto-start
+                updateUrlFindingButtons();
             } else if (job.status === 'completed' || job.status === 'error') {
                 clearInterval(pollInterval);
                 if (job.status === 'completed') {
@@ -296,9 +330,182 @@ function updateProgress(job) {
 
 let currentStore = null;
 let emailCheckInterval = null;
+let batchEmailScrapingInterval = null; // Interval for monitoring batch email scraping
 let isFindingUrl = false; // Guard to prevent concurrent findStoreUrl calls
 let isAutoTriggering = false; // Guard to prevent multiple auto-triggers
 let isEmailScrapingInProgress = false; // Track if email scraping is in progress
+
+let urlFindingStatusInterval = null;
+
+async function displayUrlFindingStatus(statusData) {
+    const container = document.getElementById('stores-container');
+    
+    const total = statusData.total_stores || 0;
+    const found = statusData.stores_with_urls || 0;
+    const pending = statusData.pending_count || 0;
+    const progressPercent = statusData.progress_percent || 0;
+    
+    let html = '<div style="margin-bottom: 20px;">';
+    html += '<h3>🔍 URL Finding Phase</h3>';
+    html += '<p style="color: #666; font-size: 14px; margin-top: 5px;">Finding store URLs for all reviews. Email scraping will start after all URLs are found.</p>';
+    html += '</div>';
+    
+    // Progress summary card
+    html += '<div style="margin-bottom: 20px; padding: 15px; background: linear-gradient(135deg, #3498db 0%, #2980b9 100%); border-radius: 8px; color: white;">';
+    html += '<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-bottom: 15px;">';
+    html += `<div><div style="font-size: 24px; font-weight: bold;">${found}</div><div style="font-size: 12px; opacity: 0.9;">URLs Found</div></div>`;
+    html += `<div><div style="font-size: 24px; font-weight: bold;">${pending}</div><div style="font-size: 12px; opacity: 0.9;">Pending</div></div>`;
+    html += `<div><div style="font-size: 24px; font-weight: bold;">${total}</div><div style="font-size: 12px; opacity: 0.9;">Total Stores</div></div>`;
+    html += '</div>';
+    
+    // Progress bar
+    html += '<div style="background: rgba(255,255,255,0.2); border-radius: 10px; height: 20px; overflow: hidden; margin-top: 10px;">';
+    html += `<div style="background: white; height: 100%; width: ${progressPercent}%; transition: width 0.3s; display: flex; align-items: center; justify-content: center; color: #3498db; font-size: 11px; font-weight: bold;">${progressPercent}%</div>`;
+    html += '</div>';
+    html += '</div>';
+    
+    // Current store being processed
+    if (currentStore && !currentStore.base_url) {
+        const escapedStoreName = (currentStore.store_name || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
+        const escapedCountry = (currentStore.country || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
+        
+        html += '<div style="margin-bottom: 20px;">';
+        html += '<h4 style="margin: 0 0 15px 0; color: #3498db; font-size: 16px;">🔍 Currently Finding URL</h4>';
+        html += '<div class="store-item" style="border: 2px solid #3498db; border-radius: 8px; padding: 15px; background: #fff; box-shadow: 0 2px 4px rgba(52,152,219,0.2);">';
+        html += `<h4 style="margin: 0 0 10px 0;">${currentStore.store_name}</h4>`;
+        html += `<p style="margin: 5px 0; font-size: 13px; color: #666;"><strong>Country:</strong> ${currentStore.country || 'N/A'}</p>`;
+        if (currentStore.rating) {
+            html += `<p style="margin: 5px 0;"><strong>Rating:</strong> ${'★'.repeat(currentStore.rating)}${'☆'.repeat(5 - currentStore.rating)} (${currentStore.rating} stars)</p>`;
+        }
+        html += `<p style="margin: 5px 0; font-size: 13px; color: #666;"><strong>Review:</strong> ${currentStore.review_text ? (currentStore.review_text.substring(0, 100) + '...') : 'N/A'}</p>`;
+        html += `<div style="margin-top: 15px;">`;
+        if (!isFindingUrl) {
+            html += `<button class="btn-small" onclick="findStoreUrl(${currentStore.id}, '${escapedStoreName}', '${escapedCountry}')">Find URL</button>`;
+            html += `<button class="btn-small btn-skip" onclick="skipStore(${currentStore.id})" style="margin-left: 10px;">Skip</button>`;
+        } else {
+            html += `<p class="info-message" style="color: #3498db; font-weight: 500;">🔍 Finding URL...</p>`;
+        }
+        html += `</div></div></div>`;
+    }
+    
+    // Pending stores section - always show if there are pending stores
+    if (pending > 0) {
+        html += '<div style="margin-bottom: 20px;">';
+        html += '<h4 style="margin: 0 0 15px 0; color: #95a5a6; font-size: 16px;">⏳ Waiting for URL Finding</h4>';
+        
+        if (!urlFindingActive && !currentStore) {
+            html += '<p style="color: #e74c3c; font-size: 14px; margin-bottom: 15px; padding: 10px; background: #ffe6e6; border-radius: 4px; border-left: 4px solid #e74c3c;">';
+            html += '⚠️ URL finding is not active. Click "Start URL Finding" button above to begin processing these stores.';
+            html += '</p>';
+        }
+        
+        html += '<div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 15px;">';
+        
+        // Show pending stores from statusData
+        if (statusData.pending_stores && statusData.pending_stores.length > 0) {
+            const pendingToShow = Math.min(statusData.pending_stores.length, 20); // Show up to 20
+            for (let i = 0; i < pendingToShow; i++) {
+                const store = statusData.pending_stores[i];
+                html += `
+                    <div class="store-item" style="border: 2px solid #95a5a6; border-radius: 8px; padding: 15px; background: #f8f9fa;">
+                        <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 10px;">
+                            <h4 style="margin: 0; flex: 1; font-size: 15px;">${store.store_name || 'N/A'}</h4>
+                            <span style="background: #95a5a6; color: white; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: bold;">⏳ #${i + 1}</span>
+                        </div>
+                        <p style="margin: 5px 0; font-size: 13px; color: #666;"><strong>Country:</strong> ${store.country || 'N/A'}</p>
+                        ${store.rating ? `<p style="margin: 5px 0;"><strong>Rating:</strong> ${'★'.repeat(store.rating)}${'☆'.repeat(5 - store.rating)} (${store.rating} stars)</p>` : ''}
+                    </div>
+                `;
+            }
+            
+            if (pending > pendingToShow) {
+                html += `
+                    <div class="store-item" style="border: 2px solid #e0e0e0; border-radius: 8px; padding: 15px; background: #f5f5f5; text-align: center;">
+                        <p style="margin: 0; color: #666; font-size: 13px; font-weight: 500;">+ ${pending - pendingToShow} more stores pending</p>
+                    </div>
+                `;
+            }
+        } else {
+            // If no pending stores in response but pending count > 0, show a message
+            html += `
+                <div class="store-item" style="border: 2px solid #95a5a6; border-radius: 8px; padding: 15px; background: #f8f9fa; text-align: center;">
+                    <p style="margin: 0; color: #666; font-size: 13px;">${pending} stores pending URL finding</p>
+                </div>
+            `;
+        }
+        
+        html += '</div></div>';
+    }
+    
+    // Recently found URLs section
+    if (statusData.recently_found && statusData.recently_found.length > 0) {
+        html += '<div style="margin-bottom: 20px;">';
+        html += '<h4 style="margin: 0 0 15px 0; color: #27ae60; font-size: 16px;">✅ Recently Found URLs</h4>';
+        html += '<div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 15px;">';
+        
+        for (const store of statusData.recently_found) {
+            html += `
+                <div class="store-item" style="border: 2px solid #27ae60; border-radius: 8px; padding: 15px; background: #f0f9f4;">
+                    <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 10px;">
+                        <h4 style="margin: 0; flex: 1; font-size: 15px;">${store.store_name || 'N/A'}</h4>
+                        <span style="background: #27ae60; color: white; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: bold;">✅ Found</span>
+                    </div>
+                    <p style="margin: 5px 0; font-size: 13px; color: #666;"><strong>Country:</strong> ${store.country || 'N/A'}</p>
+                    ${store.base_url ? `<p style="margin: 5px 0; font-size: 12px; color: #0066cc; word-break: break-all;"><strong>URL:</strong> ${store.base_url}</p>` : ''}
+                </div>
+            `;
+        }
+        
+        html += '</div></div>';
+    }
+    
+    container.innerHTML = html;
+    updateStatistics();
+}
+
+function startUrlFindingStatusMonitor() {
+    if (urlFindingStatusInterval) {
+        clearInterval(urlFindingStatusInterval);
+    }
+    
+    urlFindingStatusInterval = setInterval(async () => {
+        if (!urlFindingActive) {
+            clearInterval(urlFindingStatusInterval);
+            urlFindingStatusInterval = null;
+            return;
+        }
+        
+        try {
+            const response = await fetch('/api/stores/url-finding-status');
+            if (response.ok) {
+                const statusData = await response.json();
+                await displayUrlFindingStatus(statusData);
+                updateUrlFindingButtons();
+                
+                // If all URLs are found, stop monitoring and start email scraping
+                if (statusData.is_complete && statusData.stores_with_urls > 0) {
+                    urlFindingActive = false;
+                    clearInterval(urlFindingStatusInterval);
+                    urlFindingStatusInterval = null;
+                    updateUrlFindingButtons();
+                    showStatus('All URLs found! Starting email scraping...', 'success');
+                    setTimeout(async () => {
+                        await startBatchEmailScraping();
+                    }, 1000);
+                } else if (statusData.pending_count === 0 && statusData.stores_with_urls === 0) {
+                    // No more stores to process
+                    urlFindingActive = false;
+                    clearInterval(urlFindingStatusInterval);
+                    urlFindingStatusInterval = null;
+                    updateUrlFindingButtons();
+                    showStatus('No more stores to process.', 'info');
+                }
+            }
+        } catch (error) {
+            console.error('Error checking URL finding status:', error);
+        }
+    }, 3000);
+}
 
 async function loadNextStore() {
     try {
@@ -308,6 +515,17 @@ async function loadNextStore() {
         const container = document.getElementById('stores-container');
         
         if (!data.store) {
+            // Check if we're in URL finding phase
+            const urlStatusResponse = await fetch('/api/stores/url-finding-status');
+            if (urlStatusResponse.ok) {
+                const urlStatus = await urlStatusResponse.json();
+                if (!urlStatus.is_complete) {
+                    // Still finding URLs, show status
+                    startUrlFindingStatusMonitor();
+                    return;
+                }
+            }
+            
             container.innerHTML = '<p>No more stores pending. All reviews have been processed!</p>';
             if (emailCheckInterval) {
                 clearInterval(emailCheckInterval);
@@ -318,51 +536,53 @@ async function loadNextStore() {
         
         currentStore = data.store;
         
+        // Start URL finding status monitor if not already running
+        if (!urlFindingStatusInterval) {
+            startUrlFindingStatusMonitor();
+        }
+        
         // Escape strings for use in onclick attributes
         const escapedStoreName = (currentStore.store_name || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
         const escapedCountry = (currentStore.country || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
         
-        container.innerHTML = `
-            <div class="store-item">
-                <h4>${currentStore.store_name}</h4>
-                <p><strong>Country:</strong> ${currentStore.country || 'N/A'}</p>
-                ${currentStore.rating ? `<p><strong>Rating:</strong> ${'★'.repeat(currentStore.rating)}${'☆'.repeat(5 - currentStore.rating)} (${currentStore.rating} stars)</p>` : ''}
-                <p><strong>Review:</strong> ${currentStore.review_text ? (currentStore.review_text.substring(0, 100) + '...') : 'N/A'}</p>
-                <p><strong>Status:</strong> ${currentStore.status}</p>
-                ${currentStore.base_url ? `<p><strong>URL:</strong> ${currentStore.base_url}</p>` : ''}
-                ${currentStore.emails && currentStore.emails.length > 0 ? `<p><strong>Emails:</strong> ${currentStore.emails.join(', ')}</p>` : ''}
-                ${autoMode && !currentStore.base_url ? `<p class="info-message" style="color: #3498db; font-weight: 500;">🤖 Auto mode: Finding URL automatically...</p>` : ''}
-                <div class="store-actions">
-                    ${!currentStore.base_url ? `
-                        <button class="btn-small" onclick="findStoreUrl(${currentStore.id}, '${escapedStoreName}', '${escapedCountry}')">Find URL</button>
-                        <button class="btn-small btn-skip" onclick="skipStore(${currentStore.id})">Skip</button>
-                    ` : ''}
-                    ${currentStore.base_url && 
-                      (currentStore.status === 'url_verified' || currentStore.status === 'url_found') &&
-                      (!currentStore.emails || currentStore.emails.length === 0) &&
-                      currentStore.status !== 'emails_found' ? `
-                        <p class="info-message">Email scraping in progress... Please wait.</p>
-                    ` : ''}
+        // Show current store in context of URL finding status
+        const urlStatusResponse = await fetch('/api/stores/url-finding-status');
+        if (urlStatusResponse.ok) {
+            const urlStatus = await urlStatusResponse.json();
+            await displayUrlFindingStatus(urlStatus);
+            // Don't return here - continue to auto-trigger logic below
+        } else {
+            // Fallback to simple display if status fetch fails
+            container.innerHTML = `
+                <div class="store-item">
+                    <h4>${currentStore.store_name}</h4>
+                    <p><strong>Country:</strong> ${currentStore.country || 'N/A'}</p>
+                    ${currentStore.rating ? `<p><strong>Rating:</strong> ${'★'.repeat(currentStore.rating)}${'☆'.repeat(5 - currentStore.rating)} (${currentStore.rating} stars)</p>` : ''}
+                    <p><strong>Review:</strong> ${currentStore.review_text ? (currentStore.review_text.substring(0, 100) + '...') : 'N/A'}</p>
+                    <p><strong>Status:</strong> ${currentStore.status}</p>
+                    ${currentStore.base_url ? `<p><strong>URL:</strong> ${currentStore.base_url}</p>` : ''}
+                    ${currentStore.emails && currentStore.emails.length > 0 ? `<p><strong>Emails:</strong> ${currentStore.emails.join(', ')}</p>` : ''}
+                    ${autoMode && !currentStore.base_url ? `<p class="info-message" style="color: #3498db; font-weight: 500;">🤖 Auto mode: Finding URL automatically...</p>` : ''}
+                    <div class="store-actions">
+                        ${!currentStore.base_url ? `
+                            <button class="btn-small" onclick="findStoreUrl(${currentStore.id}, '${escapedStoreName}', '${escapedCountry}')">Find URL</button>
+                            <button class="btn-small btn-skip" onclick="skipStore(${currentStore.id})">Skip</button>
+                        ` : ''}
+                        ${currentStore.base_url && (!currentStore.emails || currentStore.emails.length === 0) ? `
+                            <p class="info-message" style="color: #27ae60;">✓ URL found. Email scraping will start after all URLs are found.</p>
+                        ` : ''}
+                    </div>
                 </div>
-            </div>
-        `;
-        
-        // If URL is set but emails are not found yet, start checking for completion
-        // Only start checking if status is NOT already 'emails_found' (email scraping might still be in progress)
-        const isEmailScrapingComplete = currentStore.status === 'emails_found' || currentStore.status === 'no_emails_found';
-        if (currentStore.base_url && !isEmailScrapingComplete && (!currentStore.emails || currentStore.emails.length === 0)) {
-            // Mark email scraping as in progress
-            isEmailScrapingInProgress = true;
-            startEmailStatusCheck();
-            // DO NOT proceed to auto-mode - wait for emails to complete
-            return;
+            `;
         }
         
-        // If store already has emails found status but we're checking again, refresh display and move on
-        if (currentStore.base_url && isEmailScrapingComplete && autoMode) {
-            // Store is complete, move to next store
+        // If store has URL but no emails, it's in the URL finding phase
+        // Email scraping will happen later in batch mode
+        // Just move to next store if auto-mode is enabled and URL finding is active
+        if (urlFindingActive && autoMode && currentStore.base_url && (!currentStore.emails || currentStore.emails.length === 0)) {
+            // URL found, move to next store to find more URLs
             setTimeout(async () => {
-                if (!isEmailScrapingInProgress && !isFindingUrl) {
+                if (!isFindingUrl && urlFindingActive) {
                     await loadNextStore();
                     updateStatistics();
                 }
@@ -370,11 +590,11 @@ async function loadNextStore() {
             return;
         }
         
-        // If store already has emails, it's complete - move to next store if auto-mode is enabled
-        if (autoMode && currentStore.base_url && currentStore.emails && currentStore.emails.length > 0) {
-            // Store is already complete, move to next store
+        // If store already has emails, it's complete - move to next store if auto-mode is enabled and URL finding is active
+        if (urlFindingActive && autoMode && currentStore.base_url && currentStore.emails && currentStore.emails.length > 0) {
+            // Store is complete, move to next store
             setTimeout(async () => {
-                if (!isEmailScrapingInProgress && !isFindingUrl) {
+                if (!isFindingUrl && urlFindingActive) {
                     await loadNextStore();
                     updateStatistics();
                 }
@@ -384,10 +604,10 @@ async function loadNextStore() {
         
         // Auto-mode: automatically trigger Find URL ONLY if:
         // 1. Store has no URL
-        // 2. Email scraping is NOT in progress
-        // 3. Not already finding URL
-        // 4. Auto-mode is enabled
-        if (autoMode && !currentStore.base_url && !isEmailScrapingInProgress && !isFindingUrl) {
+        // 2. Not already finding URL
+        // 3. Auto-mode is enabled
+        // 4. URL finding is actively running
+        if (urlFindingActive && autoMode && !currentStore.base_url && !isFindingUrl) {
             // Ensure clean state
             closeModal();
             
@@ -398,12 +618,11 @@ async function loadNextStore() {
             setTimeout(() => {
                 // Double-check conditions before triggering (ensure currentStore hasn't changed)
                 // CRITICAL: Also check that email scraping is not in progress
-                if (autoMode && 
+                if (urlFindingActive && autoMode && 
                     currentStore && 
                     currentStore.id === data.store.id && 
                     !currentStore.base_url && 
-                    !isFindingUrl && 
-                    !isEmailScrapingInProgress) {
+                    !isFindingUrl) {
                     
                     console.log('🤖 Auto-mode: Triggering Find URL', {
                         storeId: currentStore.id,
@@ -411,7 +630,7 @@ async function loadNextStore() {
                         hasBaseUrl: !!currentStore.base_url,
                         isFindingUrl,
                         isAutoTriggering,
-                        isEmailScrapingInProgress
+                        urlFindingActive
                     });
                     showStatus('🤖 Auto mode: Automatically finding URL...', 'info');
                     findStoreUrl(currentStore.id, currentStore.store_name, currentStore.country || '');
@@ -420,11 +639,11 @@ async function loadNextStore() {
                     isAutoTriggering = false;
                     console.log('🤖 Auto-mode: Conditions changed, skipping Find URL', {
                         autoMode,
+                        urlFindingActive,
                         hasCurrentStore: !!currentStore,
                         storeIdMatch: currentStore?.id === data.store.id,
                         hasBaseUrl: !!currentStore?.base_url,
-                        isFindingUrl,
-                        isEmailScrapingInProgress
+                        isFindingUrl
                     });
                 }
             }, 500);
@@ -432,6 +651,13 @@ async function loadNextStore() {
     } catch (error) {
         console.error('Error loading next store:', error);
     }
+}
+
+async function skipStoreFromUrlSelection(storeId) {
+    // Skip store from URL selection modal - closes modal and skips
+    closeModal();
+    isFindingUrl = false;
+    await skipStore(storeId);
 }
 
 async function skipStore(storeId) {
@@ -617,14 +843,8 @@ async function refreshCurrentStoreDisplay() {
         
         const container = document.getElementById('stores-container');
         
-        // Determine if email scraping is complete based on status
-        const isEmailScrapingComplete = currentStore.status === 'emails_found' || currentStore.status === 'no_emails_found';
         const hasEmails = currentStore.emails && currentStore.emails.length > 0;
-        // Only show "in progress" if URL exists, status is NOT complete, and emails are not yet found
-        const isScrapingInProgress = currentStore.base_url && 
-                                     !isEmailScrapingComplete && 
-                                     (!hasEmails) &&
-                                     (currentStore.status === 'url_verified' || currentStore.status === 'url_found');
+        const isEmailScrapingComplete = currentStore.status === 'emails_found' || currentStore.status === 'no_emails_found';
         
         container.innerHTML = `
             <div class="store-item">
@@ -641,8 +861,8 @@ async function refreshCurrentStoreDisplay() {
                         <button class="btn-small" onclick="findStoreUrl(${currentStore.id}, '${escapedStoreName}', '${escapedCountry}')">Find URL</button>
                         <button class="btn-small btn-skip" onclick="skipStore(${currentStore.id})">Skip</button>
                     ` : ''}
-                    ${isScrapingInProgress ? `
-                        <p class="info-message">Email scraping in progress... Please wait.</p>
+                    ${currentStore.base_url && (!hasEmails) ? `
+                        <p class="info-message" style="color: #27ae60;">✓ URL found. Email scraping will start after all URLs are found.</p>
                     ` : ''}
                 </div>
             </div>
@@ -657,6 +877,395 @@ async function loadPendingStores() {
     await loadNextStore();
 }
 
+async function startUrlFinding() {
+    if (urlFindingActive) {
+        showStatus('URL finding is already running.', 'info');
+        return;
+    }
+    
+    // Check if auto mode is enabled (warn but don't block)
+    if (!autoMode) {
+        showStatus('Auto Mode is not enabled. URL finding will work but may require manual intervention.', 'warning');
+    }
+    
+    // Reset state to ensure clean restart
+    currentStore = null;
+    isFindingUrl = false;
+    isAutoTriggering = false;
+    
+    urlFindingActive = true;
+    updateUrlFindingButtons();
+    showStatus('Starting URL finding...', 'info');
+    
+    // Check if email scraping is in progress first
+    try {
+        const batchStatusResponse = await fetch('/api/email-scraping/batch/status');
+        if (batchStatusResponse.ok) {
+            const batchStatus = await batchStatusResponse.json();
+            if (batchStatus.is_processing || batchStatus.pending_count > 0) {
+                showStatus('Email scraping is in progress. URL finding will start after email scraping completes.', 'info');
+                urlFindingActive = false;
+                updateUrlFindingButtons();
+                return;
+            }
+        }
+    } catch (error) {
+        console.error('Error checking batch status:', error);
+    }
+    
+    // Check URL finding status
+    try {
+        const urlStatusResponse = await fetch('/api/stores/url-finding-status');
+        if (urlStatusResponse.ok) {
+            const urlStatus = await urlStatusResponse.json();
+            
+            // Priority: Check for pending URLs first - URL finding must complete before email scraping
+            if (urlStatus.pending_count > 0) {
+                // Start URL finding - there are still pending URLs to find
+                startUrlFindingStatusMonitor();
+                // Load the first store to start processing
+                await loadNextStore();
+                showStatus('URL finding started!', 'success');
+                return;
+            } else if (urlStatus.is_complete && urlStatus.stores_with_urls > 0) {
+                // All URLs found (no pending), now start email scraping
+                urlFindingActive = false;
+                updateUrlFindingButtons();
+                await startBatchEmailScraping();
+                return;
+            } else {
+                // No pending URLs and no stores with URLs
+                showStatus('No stores pending URL finding.', 'info');
+                urlFindingActive = false;
+                updateUrlFindingButtons();
+                // Still show the status
+                await displayUrlFindingStatus(urlStatus);
+                return;
+            }
+        }
+    } catch (error) {
+        console.error('Error starting URL finding:', error);
+        showStatus('Error starting URL finding.', 'error');
+        urlFindingActive = false;
+        updateUrlFindingButtons();
+    }
+}
+
+function stopUrlFinding() {
+    if (!urlFindingActive) {
+        showStatus('URL finding is not running.', 'info');
+        return;
+    }
+    
+    urlFindingActive = false;
+    
+    // Stop the status monitor
+    if (urlFindingStatusInterval) {
+        clearInterval(urlFindingStatusInterval);
+        urlFindingStatusInterval = null;
+    }
+    
+    // Reset flags and state
+    isFindingUrl = false;
+    isAutoTriggering = false;
+    currentStore = null; // Clear current store so restart works properly
+    closeModal();
+    
+    updateUrlFindingButtons();
+    showStatus('URL finding stopped.', 'info');
+    
+    // Show current status without auto-loading next store
+    fetch('/api/stores/url-finding-status')
+        .then(response => response.json())
+        .then(statusData => displayUrlFindingStatus(statusData))
+        .catch(error => console.error('Error fetching URL status:', error));
+}
+
+function updateUrlFindingButtons() {
+    const startBtn = document.getElementById('start-url-finding');
+    const stopBtn = document.getElementById('stop-url-finding');
+    
+    if (!startBtn || !stopBtn) return;
+    
+    // Check if there are pending stores
+    fetch('/api/stores/url-finding-status')
+        .then(response => response.json())
+        .then(statusData => {
+            const hasPending = statusData.pending_count > 0 && !statusData.is_complete;
+            
+            // Show buttons if there are pending stores (regardless of auto mode)
+            // Auto mode is only required to actually start automatically
+            if (hasPending) {
+                if (urlFindingActive) {
+                    startBtn.style.display = 'none';
+                    stopBtn.style.display = 'block';
+                } else {
+                    startBtn.style.display = 'block';
+                    stopBtn.style.display = 'none';
+                }
+            } else {
+                startBtn.style.display = 'none';
+                stopBtn.style.display = 'none';
+            }
+        })
+        .catch(error => {
+            console.error('Error checking URL status for buttons:', error);
+            startBtn.style.display = 'none';
+            stopBtn.style.display = 'none';
+        });
+}
+
+async function startBatchEmailScraping() {
+    try {
+        showStatus('Starting batch email scraping...', 'info');
+        const response = await fetch('/api/email-scraping/batch/start', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'}
+        });
+        
+        if (response.ok) {
+            const data = await response.json();
+            showStatus(`Batch email scraping started. ${data.active_count} stores processing concurrently.`, 'success');
+            startBatchEmailScrapingMonitor();
+        } else {
+            const error = await response.json();
+            showStatus(`Error: ${error.message || 'Failed to start batch email scraping'}`, 'error');
+        }
+    } catch (error) {
+        showStatus(`Error: ${error.message}`, 'error');
+    }
+}
+
+function startBatchEmailScrapingMonitor() {
+    if (batchEmailScrapingInterval) {
+        clearInterval(batchEmailScrapingInterval);
+    }
+    
+    batchEmailScrapingInterval = setInterval(async () => {
+        try {
+            const response = await fetch('/api/email-scraping/batch/status');
+            if (response.ok) {
+                const data = await response.json();
+                await displayBatchEmailScrapingStatus(data);
+                
+                // Continuously fill available slots to maintain 10 active jobs
+                if (data.available_slots > 0 && data.pending_count > 0) {
+                    // Start jobs to fill available slots - do them in parallel, not sequentially
+                    const jobsToStart = Math.min(data.available_slots, data.pending_count);
+                    const startPromises = [];
+                    
+                    for (let i = 0; i < jobsToStart; i++) {
+                        startPromises.push(
+                            fetch('/api/email-scraping/start-next-job', {
+                                method: 'POST',
+                                headers: {'Content-Type': 'application/json'}
+                            }).then(async (startResponse) => {
+                                if (startResponse.ok) {
+                                    const startData = await startResponse.json();
+                                    if (startData.success) {
+                                        console.log(`Started email scraping for store ${startData.store_id}. Active: ${startData.active_count}/${startData.max_concurrent}`);
+                                    } else {
+                                        console.log(`Could not start job: ${startData.message || 'Unknown reason'}`);
+                                    }
+                                    return startData;
+                                } else {
+                                    const errorData = await startResponse.json().catch(() => ({}));
+                                    console.log(`Failed to start job: ${errorData.message || 'HTTP error'}`);
+                                    return null;
+                                }
+                            }).catch(error => {
+                                console.error('Error starting next email scraping job:', error);
+                                return null;
+                            })
+                        );
+                    }
+                    
+                    // Wait for all to complete (but they're running in parallel)
+                    const results = await Promise.all(startPromises);
+                    const successful = results.filter(r => r && r.success).length;
+                    if (successful > 0) {
+                        console.log(`Successfully started ${successful} out of ${jobsToStart} requested jobs`);
+                    }
+                }
+                
+                // Check if all done
+                if (!data.is_processing && data.pending_count === 0 && data.active_count === 0) {
+                    // All done
+                    clearInterval(batchEmailScrapingInterval);
+                    batchEmailScrapingInterval = null;
+                    showStatus('All email scraping completed!', 'success');
+                    updateStatistics();
+                    
+                    // Check for more stores that need URL finding
+                    const nextStoreResponse = await fetch('/api/stores/next');
+                    if (nextStoreResponse.ok) {
+                        const nextStoreData = await nextStoreResponse.json();
+                        if (nextStoreData.store) {
+                            await loadNextStore();
+                        }
+                    }
+                }
+            }
+        } catch (error) {
+            console.error('Error checking batch email scraping status:', error);
+        }
+    }, 3000); // Check every 3 seconds
+}
+
+async function displayBatchEmailScrapingStatus(statusData) {
+    const container = document.getElementById('stores-container');
+    
+    // Progress calculation
+    const total = statusData.total_with_urls || 0;
+    const completed = statusData.total_completed || 0;
+    const active = statusData.active_count || 0;
+    const pending = statusData.pending_count || 0;
+    const progressPercent = statusData.progress_percent || 0;
+    
+    // Debug logging
+    if (active > 0) {
+        console.log(`Email scraping status: ${active} active, ${statusData.active_stores?.length || 0} active stores in response`, {
+            active_count: active,
+            active_stores_length: statusData.active_stores?.length || 0,
+            active_store_ids: statusData.active_store_ids?.length || 0,
+            active_stores: statusData.active_stores
+        });
+    }
+    
+    let html = '<div style="margin-bottom: 20px;">';
+    html += '<h3>📧 Email Scraping Phase (Continuous Processing)</h3>';
+    html += '<p style="color: #666; font-size: 14px; margin-top: 5px;">Always maintaining 10 active stores. When one completes, the next automatically starts.</p>';
+    html += '</div>';
+    
+    // Progress summary card
+    html += '<div style="margin-bottom: 20px; padding: 15px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 8px; color: white;">';
+    html += '<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-bottom: 15px;">';
+    html += `<div><div style="font-size: 24px; font-weight: bold;">${completed}</div><div style="font-size: 12px; opacity: 0.9;">Completed</div></div>`;
+    html += `<div><div style="font-size: 24px; font-weight: bold;">${active}</div><div style="font-size: 12px; opacity: 0.9;">Active Now</div></div>`;
+    html += `<div><div style="font-size: 24px; font-weight: bold;">${pending}</div><div style="font-size: 12px; opacity: 0.9;">In Queue</div></div>`;
+    html += `<div><div style="font-size: 24px; font-weight: bold;">${total}</div><div style="font-size: 12px; opacity: 0.9;">Total with URLs</div></div>`;
+    html += '</div>';
+    
+    // Progress bar
+    html += '<div style="background: rgba(255,255,255,0.2); border-radius: 10px; height: 20px; overflow: hidden; margin-top: 10px;">';
+    html += `<div style="background: white; height: 100%; width: ${progressPercent}%; transition: width 0.3s; display: flex; align-items: center; justify-content: center; color: #667eea; font-size: 11px; font-weight: bold;">${progressPercent}%</div>`;
+    html += '</div>';
+    html += '</div>';
+    
+    // Status details
+    html += '<div style="margin-bottom: 20px; padding: 12px; background: #f8f9fa; border-radius: 6px; border-left: 4px solid #3498db;">';
+    html += `<p style="margin: 0; font-size: 13px;"><strong>Status:</strong> ${statusData.is_processing ? '🟢 Processing' : '⏸️ Waiting'}</p>`;
+    html += `<p style="margin: 5px 0; font-size: 13px;"><strong>Active Slots:</strong> ${active}/${statusData.max_concurrent} | <strong>Available:</strong> ${statusData.available_slots}</p>`;
+    html += '</div>';
+    
+    // Active stores section - show all active stores
+    if (active > 0) {
+        html += '<div style="margin-bottom: 20px;">';
+        html += `<h4 style="margin: 0 0 15px 0; color: #f39c12; font-size: 16px;">📧 Currently Scraping (${active} Active)</h4>`;
+        html += '<div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 15px;">';
+        
+        if (statusData.active_stores && statusData.active_stores.length > 0) {
+            // Show all active stores from the response
+            for (const store of statusData.active_stores) {
+                html += `
+                    <div class="store-item" style="border: 2px solid #f39c12; border-radius: 8px; padding: 15px; background: #fff; box-shadow: 0 2px 4px rgba(243,156,18,0.2);">
+                        <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 10px;">
+                            <h4 style="margin: 0; flex: 1; font-size: 15px;">${store.store_name || 'N/A'}</h4>
+                            <span style="background: #f39c12; color: white; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; animation: pulse 2s infinite;">📧 Scraping...</span>
+                        </div>
+                        <p style="margin: 5px 0; font-size: 13px; color: #666;"><strong>Country:</strong> ${store.country || 'N/A'}</p>
+                        ${store.base_url ? `<p style="margin: 5px 0; font-size: 12px; color: #0066cc; word-break: break-all;"><strong>URL:</strong> ${store.base_url}</p>` : ''}
+                    </div>
+                `;
+            }
+        } else if (statusData.active_store_ids && statusData.active_store_ids.length > 0) {
+            // Fallback: if active_stores array is empty but we have active_store_ids, show them
+            for (const storeId of statusData.active_store_ids) {
+                html += `
+                    <div class="store-item" style="border: 2px solid #f39c12; border-radius: 8px; padding: 15px; background: #fff; box-shadow: 0 2px 4px rgba(243,156,18,0.2);">
+                        <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 10px;">
+                            <h4 style="margin: 0; flex: 1; font-size: 15px;">Store ID: ${storeId}</h4>
+                            <span style="background: #f39c12; color: white; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; animation: pulse 2s infinite;">📧 Scraping...</span>
+                        </div>
+                        <p style="margin: 5px 0; font-size: 13px; color: #666;">Loading store details...</p>
+                    </div>
+                `;
+            }
+        } else {
+            // No active stores data but active_count > 0 - show a message
+            html += `
+                <div class="store-item" style="border: 2px solid #f39c12; border-radius: 8px; padding: 15px; background: #fff; box-shadow: 0 2px 4px rgba(243,156,18,0.2);">
+                    <p style="margin: 0; color: #666; font-size: 13px;">${active} stores are being scraped (details loading...)</p>
+                </div>
+            `;
+        }
+        
+        html += '</div></div>';
+    }
+    
+    // Pending stores section
+    if (statusData.pending_stores && statusData.pending_stores.length > 0) {
+        html += '<div style="margin-bottom: 20px;">';
+        html += '<h4 style="margin: 0 0 15px 0; color: #95a5a6; font-size: 16px;">⏳ Waiting in Queue</h4>';
+        html += '<div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 15px;">';
+        
+        const pendingToShow = Math.min(statusData.pending_stores.length, 10);
+        for (let i = 0; i < pendingToShow; i++) {
+            const store = statusData.pending_stores[i];
+            html += `
+                <div class="store-item" style="border: 2px solid #95a5a6; border-radius: 8px; padding: 15px; background: #f8f9fa;">
+                    <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 10px;">
+                        <h4 style="margin: 0; flex: 1; font-size: 15px;">${store.store_name || 'N/A'}</h4>
+                        <span style="background: #95a5a6; color: white; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: bold;">⏳ #${i + 1}</span>
+                    </div>
+                    <p style="margin: 5px 0; font-size: 13px; color: #666;"><strong>Country:</strong> ${store.country || 'N/A'}</p>
+                    ${store.base_url ? `<p style="margin: 5px 0; font-size: 12px; color: #0066cc; word-break: break-all;"><strong>URL:</strong> ${store.base_url}</p>` : ''}
+                </div>
+            `;
+        }
+        
+        if (statusData.pending_count > pendingToShow) {
+            html += `
+                <div class="store-item" style="border: 2px solid #e0e0e0; border-radius: 8px; padding: 15px; background: #f5f5f5; text-align: center;">
+                    <p style="margin: 0; color: #666; font-size: 13px; font-weight: 500;">+ ${statusData.pending_count - pendingToShow} more stores in queue</p>
+                </div>
+            `;
+        }
+        
+        html += '</div></div>';
+    }
+    
+    // Recently completed stores section
+    if (statusData.completed_stores && statusData.completed_stores.length > 0) {
+        html += '<div style="margin-bottom: 20px;">';
+        html += '<h4 style="margin: 0 0 15px 0; color: #27ae60; font-size: 16px;">✅ Recently Completed</h4>';
+        html += '<div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 15px;">';
+        
+        for (const store of statusData.completed_stores) {
+            const hasEmails = store.emails && store.emails.length > 0;
+            html += `
+                <div class="store-item" style="border: 2px solid #27ae60; border-radius: 8px; padding: 15px; background: #f0f9f4;">
+                    <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 10px;">
+                        <h4 style="margin: 0; flex: 1; font-size: 15px;">${store.store_name || 'N/A'}</h4>
+                        <span style="background: #27ae60; color: white; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: bold;">✅ ${hasEmails ? 'Done' : 'No Emails'}</span>
+                    </div>
+                    <p style="margin: 5px 0; font-size: 13px; color: #666;"><strong>Country:</strong> ${store.country || 'N/A'}</p>
+                    ${store.base_url ? `<p style="margin: 5px 0; font-size: 12px; color: #0066cc; word-break: break-all;"><strong>URL:</strong> ${store.base_url}</p>` : ''}
+                    ${hasEmails ? `<p style="margin: 5px 0; font-size: 12px; color: #27ae60;"><strong>Emails:</strong> ${store.emails.join(', ')}</p>` : '<p style="margin: 5px 0; font-size: 12px; color: #95a5a6;">No emails found</p>'}
+                </div>
+            `;
+        }
+        
+        html += '</div></div>';
+    }
+    
+    // Add CSS animation for pulsing effect
+    html += '<style>@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }</style>';
+    
+    container.innerHTML = html;
+    updateStatistics();
+}
+
 async function findStoreUrl(storeId, storeName, country) {
     // Prevent concurrent calls
     if (isFindingUrl) {
@@ -664,12 +1273,7 @@ async function findStoreUrl(storeId, storeName, country) {
         return;
     }
     
-    // CRITICAL: Do not proceed if email scraping is in progress
-    if (isEmailScrapingInProgress) {
-        console.log('Cannot start Find URL - email scraping is still in progress', {storeId, storeName});
-        showStatus('Please wait for email scraping to complete before finding next URL', 'info');
-        return;
-    }
+    // Note: Email scraping is now separate, so we don't need to check if it's in progress
     
     // Validate that storeId matches currentStore (if available)
     if (currentStore && currentStore.id !== storeId) {
@@ -913,6 +1517,23 @@ async function displayExtractedUrls(urls, storeId, storeName) {
                     await selectExtractedUrl(storeId, selectedUrl);
                     return; // Exit early, don't show the selection UI
                 }
+                
+                // Auto-fallback: If AI confidence is low (< 0.7) and auto-mode is ON, automatically select first result
+                if (autoMode && urlFindingActive && aiConfidence < 0.7 && urls.length > 0) {
+                    const fallbackUrl = urls[0].url;
+                    showStatus(`⚠️ AI confidence low (${Math.round(aiConfidence * 100)}%). Auto-selecting first result to continue...`, 'info');
+                    
+                    // Ensure modal is closed and flag is reset
+                    closeModal();
+                    isFindingUrl = false;
+                    
+                    // Small delay to ensure modal is fully closed before proceeding
+                    await new Promise(resolve => setTimeout(resolve, 200));
+                    
+                    // Automatically select the first URL as fallback
+                    await selectExtractedUrl(storeId, fallbackUrl);
+                    return; // Exit early, don't show the selection UI
+                }
             }
         } else {
             console.warn('AI selection failed, showing all results');
@@ -998,6 +1619,31 @@ async function displayExtractedUrls(urls, storeId, storeName) {
     });
     
     urlsHtml += '</div>';
+    
+    // Add quick action buttons
+    urlsHtml += '<div style="margin-top: 20px; padding-top: 15px; border-top: 2px solid #ddd; background: #f9f9f9; padding: 15px; border-radius: 5px;">';
+    urlsHtml += '<p style="font-size: 13px; color: #666; margin-bottom: 12px; font-weight: 500;">Quick Actions (if AI can\'t decide):</p>';
+    urlsHtml += '<div style="display: flex; gap: 10px; flex-wrap: wrap;">';
+    
+    // Select first result button
+    if (urls.length > 0) {
+        const firstUrl = urls[0].url.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '&quot;');
+        urlsHtml += `<button class="btn-small" onclick="selectExtractedUrl(${storeId}, '${firstUrl}')" style="flex: 1; min-width: 120px; background: #2196F3; color: white; border: none; padding: 10px; border-radius: 4px; cursor: pointer; font-weight: 500;">✓ Select First</button>`;
+    }
+    
+    // Select last result button
+    if (urls.length > 1) {
+        const lastUrl = urls[urls.length - 1].url.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '&quot;');
+        urlsHtml += `<button class="btn-small" onclick="selectExtractedUrl(${storeId}, '${lastUrl}')" style="flex: 1; min-width: 120px; background: #2196F3; color: white; border: none; padding: 10px; border-radius: 4px; cursor: pointer; font-weight: 500;">✓ Select Last</button>`;
+    }
+    
+    // Skip store button
+    urlsHtml += `<button class="btn-small" onclick="skipStoreFromUrlSelection(${storeId})" style="flex: 1; min-width: 120px; background: #ff9800; color: white; border: none; padding: 10px; border-radius: 4px; cursor: pointer; font-weight: 500;">⊘ Skip Store</button>`;
+    
+    urlsHtml += '</div>';
+    urlsHtml += '<p style="font-size: 11px; color: #999; margin-top: 10px; margin-bottom: 0;">These actions will automatically proceed without waiting for manual selection.</p>';
+    urlsHtml += '</div>';
+    
     urlsHtml += '<div style="margin-top: 20px; padding-top: 15px; border-top: 1px solid #ddd;">';
     urlsHtml += '<p style="font-size: 12px; color: #666; margin-bottom: 10px;">Or enter URL manually:</p>';
     urlsHtml += '<div class="input-group">';
@@ -1030,20 +1676,41 @@ async function selectExtractedUrl(storeId, url) {
         });
         
         if (response.ok) {
-            showStatus('URL saved! Email scraping started...', 'success');
+            const data = await response.json();
+            showStatus(data.message || 'URL saved!', 'success');
             
             // Refresh the current store to get updated URL
-            const data = await response.json();
             if (currentStore && currentStore.id === storeId) {
                 currentStore.base_url = data.url;
                 // Update the display for current store
                 await refreshCurrentStoreDisplay();
             }
             
-            // CRITICAL: Start checking for email completion
-            // This will mark isEmailScrapingInProgress = true
-            // and prevent auto-mode from triggering next store until emails are done
-            startEmailStatusCheck();
+            // Reset flags
+            isFindingUrl = false;
+            isAutoTriggering = false;
+            
+            // Check if all URLs are found (pending_url_count === 0)
+            if (data.pending_url_count === 0) {
+                // All URLs found! Stop URL finding and start batch email scraping
+                urlFindingActive = false;
+                updateUrlFindingButtons();
+                showStatus('All URLs found! Starting batch email scraping...', 'success');
+                setTimeout(async () => {
+                    await startBatchEmailScraping();
+                }, 1000);
+            } else {
+                // Not all URLs found yet - if URL finding is active and auto-mode is on, move to next store
+                if (urlFindingActive && autoMode) {
+                    setTimeout(async () => {
+                        if (!isFindingUrl && !isAutoTriggering && urlFindingActive) {
+                            await loadNextStore();
+                            updateStatistics();
+                        }
+                    }, 1500);
+                }
+            }
+            
             updateStatistics();
         } else {
             const error = await response.json();

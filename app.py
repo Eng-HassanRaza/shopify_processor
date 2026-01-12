@@ -6,7 +6,9 @@ import threading
 import asyncio
 import requests
 import time
-from config import HOST, PORT, DEBUG, DATABASE_PATH, EMAIL_SCRAPER_MAX_PAGES, EMAIL_SCRAPER_DELAY, EMAIL_SCRAPER_TIMEOUT, EMAIL_SCRAPER_MAX_RETRIES, EMAIL_SCRAPER_SITEMAP_LIMIT
+from concurrent.futures import ThreadPoolExecutor
+import psycopg2.extras
+from config import HOST, PORT, DEBUG, DATABASE_URL, EMAIL_SCRAPER_MAX_PAGES, EMAIL_SCRAPER_DELAY, EMAIL_SCRAPER_TIMEOUT, EMAIL_SCRAPER_MAX_RETRIES, EMAIL_SCRAPER_SITEMAP_LIMIT
 from database import Database
 from modules.review_scraper import ReviewScraper
 from modules.url_finder import URLFinder
@@ -29,7 +31,7 @@ CORS(app, resources={
     }
 })
 
-db = Database(str(DATABASE_PATH))
+db = Database(DATABASE_URL)
 review_scraper = ReviewScraper()
 url_finder = URLFinder(headless=False)  # Visible browser for manual search
 
@@ -58,6 +60,16 @@ try:
 except Exception as e:
     logger.warning(f"Failed to initialize AI URL Selector: {e}. AI features will be disabled.")
     ai_selector = None
+
+# Thread pool executor for parallel email scraping (max 10 concurrent stores)
+MAX_CONCURRENT_EMAIL_SCRAPING = 10
+email_scraping_executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_EMAIL_SCRAPING, thread_name_prefix="email_scraper")
+
+# Track active email scraping jobs
+active_email_scraping_jobs = set()  # Track store IDs currently being scraped
+email_scraping_lock = threading.Lock()  # Thread-safe access
+
+logger.info(f"Initialized ThreadPoolExecutor with {MAX_CONCURRENT_EMAIL_SCRAPING} workers for parallel email scraping")
 
 # Add CORS headers to all responses for extension access
 @app.after_request
@@ -372,7 +384,7 @@ def get_store(store_id):
 
 @app.route('/api/stores/<int:store_id>/url', methods=['PUT'])
 def update_store_url(store_id):
-    """Update store URL and start email scraping"""
+    """Update store URL (email scraping will be handled separately after all URLs are found)"""
     data = request.json
     url = data.get('url')
     
@@ -383,12 +395,112 @@ def update_store_url(store_id):
     cleaned_url = url_finder.clean_url(url)
     db.update_store_url(store_id, cleaned_url)
     
-    # Get store name for context in email processing
-    store = db.get_store(store_id)
-    store_name = store.get('store_name') if store else None
+    logger.info(f"URL saved for store {store_id}: {cleaned_url}")
     
-    # Start email scraping in background
-    def scrape_emails():
+    # Check if all URLs are found (no more pending_url stores)
+    pending_count = db.count_pending_url_stores()
+    
+    return jsonify({
+        'success': True, 
+        'url': cleaned_url, 
+        'message': 'URL saved successfully.',
+        'pending_url_count': pending_count
+    })
+
+@app.route('/api/stores/url-finding-status', methods=['GET'])
+def get_url_finding_status():
+    """Get status of URL finding phase"""
+    pending_count = db.count_pending_url_stores()
+    
+    # Get total stores
+    conn = db.get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM stores")
+    total_stores = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM stores WHERE base_url IS NOT NULL AND base_url != ''")
+    stores_with_urls = cursor.fetchone()[0]
+    conn.close()
+    
+    # Get pending stores
+    conn = db.get_connection()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cursor.execute("SELECT * FROM stores WHERE status = 'pending_url' OR status = 'url_found' ORDER BY id LIMIT 10")
+    pending_stores = []
+    for row in cursor.fetchall():
+        store = dict(row)
+        if store.get('emails'):
+            try:
+                store['emails'] = json.loads(store['emails'])
+            except:
+                store['emails'] = []
+        else:
+            store['emails'] = []
+        pending_stores.append(store)
+    
+    # Get recently found stores
+    cursor.execute("SELECT * FROM stores WHERE base_url IS NOT NULL AND base_url != '' AND (status = 'url_verified' OR status = 'url_found') ORDER BY updated_at DESC LIMIT 5")
+    recently_found = []
+    for row in cursor.fetchall():
+        store = dict(row)
+        if store.get('emails'):
+            try:
+                store['emails'] = json.loads(store['emails'])
+            except:
+                store['emails'] = []
+        else:
+            store['emails'] = []
+        recently_found.append(store)
+    
+    conn.close()
+    
+    progress_percent = round((stores_with_urls / total_stores * 100) if total_stores > 0 else 0, 1)
+    
+    return jsonify({
+        'pending_count': pending_count,
+        'total_stores': total_stores,
+        'stores_with_urls': stores_with_urls,
+        'progress_percent': progress_percent,
+        'pending_stores': pending_stores,
+        'recently_found': recently_found,
+        'is_complete': pending_count == 0
+    })
+
+def start_next_email_scraping_job():
+    """Start the next pending store email scraping if we have capacity"""
+    with email_scraping_lock:
+        active_count = len(active_email_scraping_jobs)
+        if active_count >= MAX_CONCURRENT_EMAIL_SCRAPING:
+            return None  # Already at capacity
+        active_store_ids_set = set(active_email_scraping_jobs)
+    
+    # Get multiple pending stores and filter out already active ones
+    # Get more than we need to account for already-active ones
+    pending_stores = db.get_stores_with_urls_no_emails(limit=MAX_CONCURRENT_EMAIL_SCRAPING * 2)
+    if not pending_stores:
+        return None  # No more stores to process
+    
+    # Filter out stores that are already active
+    available_stores = [s for s in pending_stores if s['id'] not in active_store_ids_set]
+    if not available_stores:
+        return None  # All pending stores are already active
+    
+    store = available_stores[0]
+    store_id = store['id']
+    
+    # Double-check and add atomically
+    with email_scraping_lock:
+        if store_id in active_email_scraping_jobs:
+            return None  # Already processing (race condition caught)
+        active_email_scraping_jobs.add(store_id)
+    
+    logger.info(f"Starting email scraping for store {store_id}: {store.get('store_name')} (Active: {len(active_email_scraping_jobs)}/{MAX_CONCURRENT_EMAIL_SCRAPING})")
+    
+    def scrape_emails_for_store(store):
+        store_id = store['id']
+        store_url = store.get('base_url')
+        store_name = store.get('store_name')
+        
         emails = []
         raw_emails = []
         loop = None
@@ -396,67 +508,324 @@ def update_store_url(store_id):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
-                # Step 1: Scrape raw emails
-                result = loop.run_until_complete(email_scraper.scrape_emails(cleaned_url, store_name))
+                result = loop.run_until_complete(email_scraper.scrape_emails(store_url, store_name))
                 
-                # Extract raw emails
                 if isinstance(result, dict):
                     raw_emails = result.get('raw_emails', [])
                 else:
                     raw_emails = result if isinstance(result, list) else []
                 
-                logger.info(f"Email scraping completed for store {store_id}.")
-                logger.info(f"  - Raw emails found: {len(raw_emails)}")
+                logger.info(f"Email scraping completed for store {store_id}. Raw emails: {len(raw_emails)}")
                 
-                # Step 2: Use AI to extract only relevant emails
                 if ai_email_extractor and raw_emails:
-                    logger.info(f"Using AI to extract relevant emails from {len(raw_emails)} raw emails...")
-                    # AI extraction is synchronous, call directly
                     ai_result = ai_email_extractor.extract_relevant_emails(
-                        raw_emails,
-                        cleaned_url,
-                        store_name
+                        raw_emails, store_url, store_name
                     )
                     emails = ai_result.get('emails', [])
-                    ai_stats = ai_result.get('stats', {})
-                    
-                    logger.info(f"AI extraction completed:")
-                    logger.info(f"  - Raw emails: {ai_stats.get('total_raw', 0)}")
-                    logger.info(f"  - Relevant emails: {ai_stats.get('total_relevant', 0)}")
                 else:
-                    if not ai_email_extractor:
-                        logger.warning("AI Email Extractor not available, storing all raw emails")
                     emails = raw_emails
                 
             except Exception as e:
-                logger.error(f"Error during email scraping: {e}", exc_info=True)
-                # Continue to update status even on error
+                logger.error(f"Error during email scraping for store {store_id}: {e}", exc_info=True)
             finally:
                 if loop:
                     loop.close()
             
-            # ALWAYS update store status, even if no emails found or error occurred
-            # This ensures the frontend knows scraping is complete
             try:
-                db.update_store_emails(store_id, emails, raw_emails)
-                logger.info(f"Stored {len(emails)} relevant emails and {len(raw_emails)} raw emails for store {store_id}.")
+                db.update_store_emails(store_id, emails, raw_emails, None)
+                logger.info(f"Stored {len(emails)} relevant emails for store {store_id}")
             except Exception as e:
-                logger.error(f"Error updating store emails in database: {e}", exc_info=True)
-                
+                logger.error(f"Error updating store emails for store {store_id}: {e}", exc_info=True)
         except Exception as e:
-            logger.error(f"Critical error in email scraping thread: {e}", exc_info=True)
-            # Last resort: try to mark as complete with empty emails
+            logger.error(f"Critical error in email scraping for store {store_id}: {e}", exc_info=True)
             try:
-                db.update_store_emails(store_id, [], [])
-                logger.info(f"Marked store {store_id} as complete (no emails) after error")
+                db.update_store_emails(store_id, [], [], f"Critical error: {type(e).__name__}: {str(e)}")
             except:
-                logger.error(f"Failed to update store status after critical error")
+                pass
+        finally:
+            with email_scraping_lock:
+                active_email_scraping_jobs.discard(store_id)
+                remaining_active = len(active_email_scraping_jobs)
+            
+            logger.info(f"Finished email scraping for store {store_id}. Active jobs: {remaining_active}/{MAX_CONCURRENT_EMAIL_SCRAPING}")
+            
+            # When this job completes, start the next one if available
+            start_next_email_scraping_job()
     
-    thread = threading.Thread(target=scrape_emails)
-    thread.daemon = True
-    thread.start()
+    # Submit to executor
+    email_scraping_executor.submit(scrape_emails_for_store, store)
     
-    return jsonify({'success': True, 'url': cleaned_url, 'message': 'URL saved. Email scraping started in background.'})
+    with email_scraping_lock:
+        return {
+            'success': True,
+            'store_id': store_id,
+            'active_count': len(active_email_scraping_jobs),
+            'max_concurrent': MAX_CONCURRENT_EMAIL_SCRAPING
+        }
+
+@app.route('/api/email-scraping/start-next-job', methods=['POST'])
+def start_next_email_scraping_job_endpoint():
+    """API endpoint to start the next email scraping job if capacity available"""
+    result = start_next_email_scraping_job()
+    if result:
+        return jsonify(result)
+    else:
+        with email_scraping_lock:
+            active_count = len(active_email_scraping_jobs)
+        return jsonify({
+            'success': False,
+            'message': 'No capacity or no pending stores',
+            'active_count': active_count,
+            'max_concurrent': MAX_CONCURRENT_EMAIL_SCRAPING
+        })
+
+@app.route('/api/email-scraping/batch/start', methods=['POST'])
+def start_batch_email_scraping():
+    """Start continuous email scraping: always keep 10 stores processing"""
+    with email_scraping_lock:
+        active_count = len(active_email_scraping_jobs)
+        active_store_ids_set = set(active_email_scraping_jobs)
+    
+    # Get pending stores - get enough for all available slots
+    jobs_to_start = min(MAX_CONCURRENT_EMAIL_SCRAPING - active_count, MAX_CONCURRENT_EMAIL_SCRAPING)
+    pending_stores = db.get_stores_with_urls_no_emails(limit=jobs_to_start * 2)  # Get extra to account for already active ones
+    
+    # Filter out stores that are already active
+    truly_pending = [s for s in pending_stores if s['id'] not in active_store_ids_set]
+    pending_count = len(truly_pending)
+    
+    if pending_count == 0:
+        return jsonify({
+            'success': False,
+            'message': 'No stores with URLs pending email scraping'
+        })
+    
+    # Start enough jobs to fill up to 10 active
+    jobs_to_start = min(MAX_CONCURRENT_EMAIL_SCRAPING - active_count, pending_count)
+    
+    logger.info(f"Starting {jobs_to_start} email scraping jobs (currently {active_count} active, {pending_count} pending)")
+    
+    # Start jobs for multiple stores at once
+    actually_started = 0
+    stores_to_process = truly_pending[:jobs_to_start]
+    
+    for store in stores_to_process:
+        store_id = store['id']
+        
+        # Double-check it's not already active
+        with email_scraping_lock:
+            if store_id in active_email_scraping_jobs:
+                continue  # Skip if already active
+            active_email_scraping_jobs.add(store_id)
+        
+        logger.info(f"Starting email scraping for store {store_id}: {store.get('store_name')} (Active: {len(active_email_scraping_jobs)}/{MAX_CONCURRENT_EMAIL_SCRAPING})")
+        
+        def scrape_emails_for_store(store):
+            store_id = store['id']
+            store_url = store.get('base_url')
+            store_name = store.get('store_name')
+            
+            emails = []
+            raw_emails = []
+            scraping_stats = {}
+            scraping_error = None
+            loop = None
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    result = loop.run_until_complete(email_scraper.scrape_emails(store_url, store_name))
+                    
+                    if isinstance(result, dict):
+                        raw_emails = result.get('raw_emails', [])
+                        scraping_stats = result.get('stats', {})
+                    else:
+                        raw_emails = result if isinstance(result, list) else []
+                    
+                    # Log detailed stats
+                    pages_discovered = scraping_stats.get('pages_discovered', 0)
+                    pages_scraped = scraping_stats.get('pages_scraped', 0)
+                    pages_failed = scraping_stats.get('pages_failed', 0)
+                    pages_with_emails = scraping_stats.get('pages_with_emails', 0)
+                    
+                    logger.info(f"Email scraping completed for store {store_id} ({store_name}): "
+                              f"Raw emails: {len(raw_emails)}, "
+                              f"Pages: {pages_discovered} discovered, {pages_scraped} scraped, {pages_failed} failed, {pages_with_emails} with emails")
+                    
+                    # Warn if scraping seems to have failed
+                    if len(raw_emails) == 0:
+                        if pages_discovered == 0:
+                            logger.warning(f"Store {store_id} ({store_name}): No pages discovered - possible URL issue or site blocking")
+                            scraping_error = "No pages discovered"
+                        elif pages_failed == pages_discovered:
+                            logger.warning(f"Store {store_id} ({store_name}): All {pages_discovered} pages failed to scrape - possible rate limiting or site blocking")
+                            scraping_error = f"All {pages_discovered} pages failed"
+                        elif pages_scraped == 0:
+                            logger.warning(f"Store {store_id} ({store_name}): No pages successfully scraped - possible connectivity or blocking issue")
+                            scraping_error = "No pages successfully scraped"
+                        else:
+                            logger.info(f"Store {store_id} ({store_name}): Scraped {pages_scraped} pages but found no emails - likely no emails on site")
+                    
+                    if ai_email_extractor and raw_emails:
+                        ai_result = ai_email_extractor.extract_relevant_emails(
+                            raw_emails, store_url, store_name
+                        )
+                        emails = ai_result.get('emails', [])
+                    else:
+                        emails = raw_emails
+                    
+                except Exception as e:
+                    scraping_error = f"Exception during scraping: {type(e).__name__}: {str(e)}"
+                    logger.error(f"Error during email scraping for store {store_id} ({store_name}): {e}", exc_info=True)
+                finally:
+                    if loop:
+                        loop.close()
+                
+                try:
+                    db.update_store_emails(store_id, emails, raw_emails, scraping_error)
+                    if scraping_error:
+                        logger.warning(f"Store {store_id} ({store_name}): Saved with error - {scraping_error}")
+                    logger.info(f"Stored {len(emails)} relevant emails for store {store_id} ({store_name})")
+                except Exception as e:
+                    logger.error(f"Error updating store emails for store {store_id}: {e}", exc_info=True)
+            except Exception as e:
+                scraping_error = f"Critical error: {type(e).__name__}: {str(e)}"
+                logger.error(f"Critical error in email scraping for store {store_id} ({store_name}): {e}", exc_info=True)
+                try:
+                    db.update_store_emails(store_id, [], [], scraping_error)
+                except:
+                    pass
+            finally:
+                with email_scraping_lock:
+                    active_email_scraping_jobs.discard(store_id)
+                    remaining_active = len(active_email_scraping_jobs)
+                
+                logger.info(f"Finished email scraping for store {store_id}. Active jobs: {remaining_active}/{MAX_CONCURRENT_EMAIL_SCRAPING}")
+                
+                # When this job completes, start the next one if available
+                start_next_email_scraping_job()
+        
+        # Submit to executor
+        email_scraping_executor.submit(scrape_emails_for_store, store)
+        actually_started += 1
+    
+    # Get final active count
+    with email_scraping_lock:
+        final_active_count = len(active_email_scraping_jobs)
+    
+    logger.info(f"Started {actually_started} email scraping jobs. Now {final_active_count} active.")
+    
+    return jsonify({
+        'success': True,
+        'message': f'Email scraping started. {actually_started} stores now processing concurrently.',
+        'active_count': final_active_count,
+        'pending_count': pending_count - actually_started,
+        'jobs_started': actually_started
+    })
+
+@app.route('/api/email-scraping/batch/status', methods=['GET'])
+def get_batch_email_scraping_status():
+    """Get status of continuous email scraping"""
+    with email_scraping_lock:
+        active_count = len(active_email_scraping_jobs)
+        active_store_ids = list(active_email_scraping_jobs)
+    
+    # Get stores with URLs but no emails (pending)
+    pending_stores = db.get_stores_with_urls_no_emails()
+    pending_count = len(pending_stores)
+    
+    # Get active store details
+    active_stores = []
+    for store_id in active_store_ids:
+        store = db.get_store(store_id)
+        if store:
+            # Parse emails JSON if present
+            if store.get('emails'):
+                try:
+                    store['emails'] = json.loads(store['emails'])
+                except:
+                    store['emails'] = []
+            else:
+                store['emails'] = []
+            # Parse raw_emails JSON if present
+            if store.get('raw_emails'):
+                try:
+                    store['raw_emails'] = json.loads(store['raw_emails'])
+                except:
+                    store['raw_emails'] = []
+            else:
+                store['raw_emails'] = []
+            active_stores.append(store)
+        else:
+            # If store not found, create a minimal entry with just the ID
+            logger.warning(f"Store {store_id} is in active_email_scraping_jobs but not found in database")
+            active_stores.append({
+                'id': store_id,
+                'store_name': f'Store {store_id} (Loading...)',
+                'base_url': None,
+                'emails': [],
+                'raw_emails': []
+            })
+    
+    # Filter out stores that are already active from pending list
+    pending_store_ids = {s['id'] for s in pending_stores}
+    active_store_ids_set = set(active_store_ids)
+    truly_pending = [s for s in pending_stores if s['id'] not in active_store_ids_set]
+    
+    # Get completed stores (recently finished, last 10)
+    conn = db.get_connection()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cursor.execute("""
+        SELECT * FROM stores
+        WHERE status = 'emails_found' OR status = 'no_emails_found'
+        ORDER BY emails_scraped_at DESC
+        LIMIT 10
+    """)
+    completed_rows = cursor.fetchall()
+    conn.close()
+    
+    completed_stores = []
+    for row in completed_rows:
+        store = dict(row)
+        if store.get('emails'):
+            try:
+                store['emails'] = json.loads(store['emails'])
+            except:
+                store['emails'] = []
+        else:
+            store['emails'] = []
+        completed_stores.append(store)
+    
+    # Get total counts for progress
+    conn = db.get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM stores WHERE base_url IS NOT NULL AND base_url != ''")
+    total_with_urls = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM stores WHERE status = 'emails_found' OR status = 'no_emails_found'")
+    total_completed = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM stores WHERE status = 'pending_url'")
+    total_pending_urls = cursor.fetchone()[0]
+    conn.close()
+    
+    logger.debug(f"Email scraping status: {active_count} active, {len(truly_pending)} pending, {len(active_stores)} active stores retrieved")
+    
+    return jsonify({
+        'active_count': active_count,
+        'pending_count': len(truly_pending),
+        'max_concurrent': MAX_CONCURRENT_EMAIL_SCRAPING,
+        'active_store_ids': active_store_ids,
+        'active_stores': active_stores,  # All active stores should be here
+        'pending_stores': truly_pending[:20],  # Show next 20 pending
+        'completed_stores': completed_stores[:5],  # Show last 5 completed
+        'is_processing': active_count > 0,
+        'available_slots': MAX_CONCURRENT_EMAIL_SCRAPING - active_count,
+        'total_with_urls': total_with_urls,
+        'total_completed': total_completed,
+        'total_pending_urls': total_pending_urls,
+        'progress_percent': round((total_completed / total_with_urls * 100) if total_with_urls > 0 else 0, 1)
+    })
 
 @app.route('/api/stores/<int:store_id>/emails', methods=['PUT'])
 def update_store_emails_manual(store_id):
@@ -484,7 +853,7 @@ def update_store_emails_manual(store_id):
     raw_emails = store.get('raw_emails', [])
     
     # Update only cleaned emails, preserve raw_emails
-    db.update_store_emails(store_id, valid_emails, raw_emails)
+    db.update_store_emails(store_id, valid_emails, raw_emails, None)
     logger.info(f"Manually updated {len(valid_emails)} emails for store {store_id}")
     
     return jsonify({

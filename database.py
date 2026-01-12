@@ -1,22 +1,23 @@
 """Database management for Shopify Review Processor"""
-import sqlite3
+import psycopg2
+import psycopg2.extras
 import json
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional
 import logging
+from config import DATABASE_URL
 
 logger = logging.getLogger(__name__)
 
 class Database:
-    def __init__(self, db_path: str):
-        self.db_path = db_path
+    def __init__(self, database_url: str = None):
+        self.database_url = database_url or DATABASE_URL
         self.init_database()
     
     def get_connection(self):
         """Get database connection"""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
+        conn = psycopg2.connect(self.database_url)
         return conn
     
     def init_database(self):
@@ -27,57 +28,45 @@ class Database:
         # Stores table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS stores (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 store_name TEXT NOT NULL,
                 country TEXT,
                 review_date TEXT,
                 review_text TEXT,
                 usage_duration TEXT,
-                rating INTEGER,  -- Star rating (1-5)
+                rating INTEGER,
                 base_url TEXT,
-                url_verified BOOLEAN DEFAULT 0,
+                url_verified BOOLEAN DEFAULT FALSE,
                 verified_at TEXT,
-                emails TEXT,  -- JSON array of emails
+                raw_emails TEXT,
+                emails TEXT,
                 emails_found INTEGER DEFAULT 0,
                 emails_scraped_at TEXT,
-                status TEXT DEFAULT 'pending_url',  -- pending_url, url_found, url_verified, emails_found, completed
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                status TEXT DEFAULT 'pending_url',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 app_name TEXT
             )
         """)
-        
-        # Add rating column if it doesn't exist (migration for existing databases)
-        try:
-            cursor.execute("ALTER TABLE stores ADD COLUMN rating INTEGER")
-            logger.info("Added rating column to stores table")
-        except sqlite3.OperationalError:
-            # Column already exists, ignore
-            pass
-        
-        # Add raw_emails column if it doesn't exist (migration for existing databases)
-        try:
-            cursor.execute("ALTER TABLE stores ADD COLUMN raw_emails TEXT")
-            logger.info("Added raw_emails column to stores table")
-        except sqlite3.OperationalError:
-            # Column already exists, ignore
-            pass
+        conn.commit()
         
         # Jobs table (for tracking scraping jobs)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS jobs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 app_name TEXT NOT NULL,
                 app_url TEXT NOT NULL,
                 total_stores INTEGER DEFAULT 0,
                 stores_processed INTEGER DEFAULT 0,
-                status TEXT DEFAULT 'pending',  -- pending, scraping_reviews, finding_urls, scraping_emails, completed
+                status TEXT DEFAULT 'pending',
                 progress_message TEXT,
                 current_page INTEGER DEFAULT 0,
                 total_pages INTEGER DEFAULT 0,
                 reviews_scraped INTEGER DEFAULT 0,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                max_reviews_limit INTEGER DEFAULT 0,
+                max_pages_limit INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         
@@ -86,7 +75,7 @@ class Database:
         # Migrate existing jobs table if needed
         try:
             cursor.execute("SELECT progress_message FROM jobs LIMIT 1")
-        except sqlite3.OperationalError:
+        except psycopg2.errors.UndefinedColumn:
             logger.info("Migrating jobs table...")
             cursor.execute("ALTER TABLE jobs ADD COLUMN progress_message TEXT")
             cursor.execute("ALTER TABLE jobs ADD COLUMN current_page INTEGER DEFAULT 0")
@@ -98,7 +87,7 @@ class Database:
         # Add max_reviews_limit and max_pages_limit columns if they don't exist
         try:
             cursor.execute("SELECT max_reviews_limit FROM jobs LIMIT 1")
-        except sqlite3.OperationalError:
+        except psycopg2.errors.UndefinedColumn:
             logger.info("Adding limit columns to jobs table...")
             cursor.execute("ALTER TABLE jobs ADD COLUMN max_reviews_limit INTEGER DEFAULT 0")
             cursor.execute("ALTER TABLE jobs ADD COLUMN max_pages_limit INTEGER DEFAULT 0")
@@ -113,7 +102,7 @@ class Database:
         conn = self.get_connection()
         cursor = conn.cursor()
         
-        cursor.execute("SELECT id FROM jobs WHERE app_url = ?", (app_url,))
+        cursor.execute("SELECT id FROM jobs WHERE app_url = %s", (app_url,))
         exists = cursor.fetchone() is not None
         conn.close()
         return exists
@@ -121,9 +110,9 @@ class Database:
     def get_job_by_url(self, app_url: str) -> Optional[Dict]:
         """Get job by URL, returns job details if exists"""
         conn = self.get_connection()
-        cursor = conn.cursor()
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
-        cursor.execute("SELECT * FROM jobs WHERE app_url = ? ORDER BY id DESC LIMIT 1", (app_url,))
+        cursor.execute("SELECT * FROM jobs WHERE app_url = %s ORDER BY id DESC LIMIT 1", (app_url,))
         row = cursor.fetchone()
         conn.close()
         
@@ -134,13 +123,12 @@ class Database:
         conn = self.get_connection()
         cursor = conn.cursor()
         
-        cursor.execute("SELECT status FROM jobs WHERE id = ?", (job_id,))
+        cursor.execute("SELECT status FROM jobs WHERE id = %s", (job_id,))
         row = cursor.fetchone()
         conn.close()
         
         if row:
             status = row[0]
-            # Job is complete if it's beyond scraping_reviews phase
             return status in ['finding_urls', 'scraping_emails', 'completed']
         return False
     
@@ -151,10 +139,11 @@ class Database:
         
         cursor.execute("""
             INSERT INTO jobs (app_name, app_url, status, max_reviews_limit, max_pages_limit)
-            VALUES (?, ?, 'scraping_reviews', ?, ?)
+            VALUES (%s, %s, 'scraping_reviews', %s, %s)
+            RETURNING id
         """, (app_name, app_url, max_reviews_limit, max_pages_limit))
         
-        job_id = cursor.lastrowid
+        job_id = cursor.fetchone()[0]
         conn.commit()
         conn.close()
         return job_id
@@ -166,46 +155,46 @@ class Database:
         conn = self.get_connection()
         cursor = conn.cursor()
         
-        updates = ["status = ?", "updated_at = CURRENT_TIMESTAMP"]
+        updates = ["status = %s", "updated_at = CURRENT_TIMESTAMP"]
         params = [status]
         
         if total_stores is not None:
-            updates.append("total_stores = ?")
+            updates.append("total_stores = %s")
             params.append(total_stores)
         
         if stores_processed is not None:
-            updates.append("stores_processed = ?")
+            updates.append("stores_processed = %s")
             params.append(stores_processed)
         
         if progress_message is not None:
-            updates.append("progress_message = ?")
+            updates.append("progress_message = %s")
             params.append(progress_message)
         
         if current_page is not None:
-            updates.append("current_page = ?")
+            updates.append("current_page = %s")
             params.append(current_page)
         
         if total_pages is not None:
-            updates.append("total_pages = ?")
+            updates.append("total_pages = %s")
             params.append(total_pages)
         
         if reviews_scraped is not None:
-            updates.append("reviews_scraped = ?")
+            updates.append("reviews_scraped = %s")
             params.append(reviews_scraped)
         
         if max_reviews_limit is not None:
-            updates.append("max_reviews_limit = ?")
+            updates.append("max_reviews_limit = %s")
             params.append(max_reviews_limit)
         
         if max_pages_limit is not None:
-            updates.append("max_pages_limit = ?")
+            updates.append("max_pages_limit = %s")
             params.append(max_pages_limit)
         
         params.append(job_id)
         
         cursor.execute(f"""
             UPDATE jobs SET {', '.join(updates)}
-            WHERE id = ?
+            WHERE id = %s
         """, params)
         
         conn.commit()
@@ -221,14 +210,14 @@ class Database:
                 INSERT INTO stores (
                     store_name, country, review_date, review_text, usage_duration, rating,
                     app_name, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending_url')
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending_url')
             """, (
                 store.get('store_name'),
                 store.get('country'),
                 store.get('review_date'),
                 store.get('review_text'),
                 store.get('usage_duration'),
-                store.get('rating'),  # Can be None if not found
+                store.get('rating'),
                 app_name
             ))
         
@@ -239,7 +228,7 @@ class Database:
     def get_pending_stores(self, limit: int = None) -> List[Dict]:
         """Get stores that need URL finding"""
         conn = self.get_connection()
-        cursor = conn.cursor()
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
         query = """
             SELECT * FROM stores
@@ -257,7 +246,6 @@ class Database:
         stores = []
         for row in rows:
             store = dict(row)
-            # Parse emails JSON
             if store.get('emails'):
                 try:
                     store['emails'] = json.loads(store['emails'])
@@ -265,7 +253,6 @@ class Database:
                     store['emails'] = []
             else:
                 store['emails'] = []
-            # Parse raw_emails JSON
             if store.get('raw_emails'):
                 try:
                     store['raw_emails'] = json.loads(store['raw_emails'])
@@ -280,7 +267,7 @@ class Database:
     def get_next_pending_store(self) -> Optional[Dict]:
         """Get the next pending store (one at a time)"""
         conn = self.get_connection()
-        cursor = conn.cursor()
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
         cursor.execute("""
             SELECT * FROM stores
@@ -294,7 +281,6 @@ class Database:
         
         if row:
             store = dict(row)
-            # Parse emails JSON
             if store.get('emails'):
                 try:
                     store['emails'] = json.loads(store['emails'])
@@ -302,7 +288,6 @@ class Database:
                     store['emails'] = []
             else:
                 store['emails'] = []
-            # Parse raw_emails JSON
             if store.get('raw_emails'):
                 try:
                     store['raw_emails'] = json.loads(store['raw_emails'])
@@ -313,6 +298,62 @@ class Database:
             return store
         return None
     
+    def count_pending_url_stores(self) -> int:
+        """Count stores that still need URLs"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT COUNT(*) FROM stores
+            WHERE status = 'pending_url'
+        """)
+        
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count
+    
+    def get_stores_with_urls_no_emails(self, limit: int = None) -> List[Dict]:
+        """Get stores that have URLs but no emails yet (for batch email scraping)"""
+        conn = self.get_connection()
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        query = """
+            SELECT * FROM stores
+            WHERE base_url IS NOT NULL 
+            AND base_url != ''
+            AND (status = 'url_verified' OR status = 'url_found')
+            AND (emails IS NULL OR emails = '' OR emails = '[]')
+            ORDER BY id
+        """
+        
+        if limit:
+            query += f" LIMIT {limit}"
+        
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        conn.close()
+        
+        stores = []
+        for row in rows:
+            store = dict(row)
+            if store.get('emails'):
+                try:
+                    store['emails'] = json.loads(store['emails'])
+                except:
+                    store['emails'] = []
+            else:
+                store['emails'] = []
+            if store.get('raw_emails'):
+                try:
+                    store['raw_emails'] = json.loads(store['raw_emails'])
+                except:
+                    store['raw_emails'] = []
+            else:
+                store['raw_emails'] = []
+            stores.append(store)
+        
+        return stores
+    
     def skip_store(self, store_id: int):
         """Skip a store (mark as skipped)"""
         conn = self.get_connection()
@@ -321,7 +362,7 @@ class Database:
         cursor.execute("""
             UPDATE stores
             SET status = 'skipped', updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
+            WHERE id = %s
         """, (store_id,))
         
         conn.commit()
@@ -334,15 +375,15 @@ class Database:
         
         cursor.execute("""
             UPDATE stores
-            SET base_url = ?, url_verified = 1, verified_at = CURRENT_TIMESTAMP,
+            SET base_url = %s, url_verified = TRUE, verified_at = CURRENT_TIMESTAMP,
                 status = 'url_verified', updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
+            WHERE id = %s
         """, (url, store_id))
         
         conn.commit()
         conn.close()
     
-    def update_store_emails(self, store_id: int, emails: List[str], raw_emails: Optional[List[str]] = None):
+    def update_store_emails(self, store_id: int, emails: List[str], raw_emails: Optional[List[str]] = None, scraping_error: Optional[str] = None):
         """Update store with scraped emails (both cleaned and raw)"""
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -350,28 +391,37 @@ class Database:
         emails_json = json.dumps(emails)
         raw_emails_json = json.dumps(raw_emails) if raw_emails else None
         
+        if scraping_error:
+            status = 'url_verified'
+        elif len(emails) > 0:
+            status = 'emails_found'
+        else:
+            status = 'no_emails_found'
+        
         cursor.execute("""
             UPDATE stores
-            SET emails = ?, raw_emails = ?, emails_found = ?, emails_scraped_at = CURRENT_TIMESTAMP,
-                status = 'emails_found', updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-        """, (emails_json, raw_emails_json, len(emails), store_id))
+            SET emails = %s, raw_emails = %s, emails_found = %s, emails_scraped_at = CURRENT_TIMESTAMP,
+                status = %s, updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+        """, (emails_json, raw_emails_json, len(emails), status, store_id))
         
         conn.commit()
         conn.close()
+        
+        if scraping_error:
+            logger.warning(f"Store {store_id} marked as {status} but scraping had errors: {scraping_error}")
     
     def get_store(self, store_id: int) -> Optional[Dict]:
         """Get a single store by ID"""
         conn = self.get_connection()
-        cursor = conn.cursor()
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
-        cursor.execute("SELECT * FROM stores WHERE id = ?", (store_id,))
+        cursor.execute("SELECT * FROM stores WHERE id = %s", (store_id,))
         row = cursor.fetchone()
         conn.close()
         
         if row:
             store = dict(row)
-            # Parse emails JSON
             if store.get('emails'):
                 try:
                     store['emails'] = json.loads(store['emails'])
@@ -379,7 +429,6 @@ class Database:
                     store['emails'] = []
             else:
                 store['emails'] = []
-            # Parse raw_emails JSON
             if store.get('raw_emails'):
                 try:
                     store['raw_emails'] = json.loads(store['raw_emails'])
@@ -393,10 +442,10 @@ class Database:
     def get_all_stores(self, app_name: str = None) -> List[Dict]:
         """Get all stores, optionally filtered by app name"""
         conn = self.get_connection()
-        cursor = conn.cursor()
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
         if app_name:
-            cursor.execute("SELECT * FROM stores WHERE app_name = ? ORDER BY id", (app_name,))
+            cursor.execute("SELECT * FROM stores WHERE app_name = %s ORDER BY id", (app_name,))
         else:
             cursor.execute("SELECT * FROM stores ORDER BY id")
         
@@ -406,7 +455,6 @@ class Database:
         stores = []
         for row in rows:
             store = dict(row)
-            # Parse emails JSON
             if store.get('emails'):
                 try:
                     store['emails'] = json.loads(store['emails'])
@@ -414,7 +462,6 @@ class Database:
                     store['emails'] = []
             else:
                 store['emails'] = []
-            # Parse raw_emails JSON
             if store.get('raw_emails'):
                 try:
                     store['raw_emails'] = json.loads(store['raw_emails'])
@@ -429,9 +476,9 @@ class Database:
     def get_job(self, job_id: int) -> Optional[Dict]:
         """Get job by ID"""
         conn = self.get_connection()
-        cursor = conn.cursor()
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
-        cursor.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
+        cursor.execute("SELECT * FROM jobs WHERE id = %s", (job_id,))
         row = cursor.fetchone()
         conn.close()
         
@@ -440,7 +487,7 @@ class Database:
     def get_all_jobs(self) -> List[Dict]:
         """Get all jobs ordered by creation date"""
         conn = self.get_connection()
-        cursor = conn.cursor()
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
         cursor.execute("SELECT * FROM jobs ORDER BY created_at DESC")
         rows = cursor.fetchall()
@@ -456,23 +503,19 @@ class Database:
         conn = self.get_connection()
         cursor = conn.cursor()
         
-        # Get store info before deletion to find associated jobs
-        placeholders = ','.join(['?'] * len(store_ids))
+        placeholders = ','.join(['%s'] * len(store_ids))
         cursor.execute(f"SELECT DISTINCT app_name FROM stores WHERE id IN ({placeholders})", store_ids)
         app_names = [row[0] for row in cursor.fetchall() if row[0]]
         
-        # Get job URLs for these app names
         app_urls = []
         if app_names:
-            app_placeholders = ','.join(['?'] * len(app_names))
+            app_placeholders = ','.join(['%s'] * len(app_names))
             cursor.execute(f"SELECT app_url FROM jobs WHERE app_name IN ({app_placeholders})", app_names)
             app_urls = [row[0] for row in cursor.fetchall()]
         
-        # Delete stores
         cursor.execute(f"DELETE FROM stores WHERE id IN ({placeholders})", store_ids)
         stores_deleted = cursor.rowcount
         
-        # Delete jobs associated with these app names
         jobs_deleted = 0
         if app_names:
             cursor.execute(f"DELETE FROM jobs WHERE app_name IN ({app_placeholders})", app_names)
@@ -491,7 +534,7 @@ class Database:
     def get_statistics(self, job_id: int = None) -> Dict:
         """Get processing statistics"""
         conn = self.get_connection()
-        cursor = conn.cursor()
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
         if job_id:
             cursor.execute("""
@@ -500,9 +543,9 @@ class Database:
                     SUM(CASE WHEN status = 'pending_url' THEN 1 ELSE 0 END) as pending_url,
                     SUM(CASE WHEN status = 'url_verified' THEN 1 ELSE 0 END) as url_verified,
                     SUM(CASE WHEN status = 'emails_found' THEN 1 ELSE 0 END) as emails_found,
-                    SUM(emails_found) as total_emails
+                    COALESCE(SUM(emails_found), 0) as total_emails
                 FROM stores
-                WHERE app_name = (SELECT app_name FROM jobs WHERE id = ?)
+                WHERE app_name = (SELECT app_name FROM jobs WHERE id = %s)
             """, (job_id,))
         else:
             cursor.execute("""
@@ -511,7 +554,7 @@ class Database:
                     SUM(CASE WHEN status = 'pending_url' THEN 1 ELSE 0 END) as pending_url,
                     SUM(CASE WHEN status = 'url_verified' THEN 1 ELSE 0 END) as url_verified,
                     SUM(CASE WHEN status = 'emails_found' THEN 1 ELSE 0 END) as emails_found,
-                    SUM(emails_found) as total_emails
+                    COALESCE(SUM(emails_found), 0) as total_emails
                 FROM stores
             """)
         
@@ -519,8 +562,6 @@ class Database:
         conn.close()
         
         stats = dict(row) if row else {}
-        # Ensure total_emails is not None
         if stats.get('total_emails') is None:
             stats['total_emails'] = 0
         return stats
-
